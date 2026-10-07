@@ -41,6 +41,8 @@ final class ControlModel: ObservableObject {
     private var terminationSignal: DispatchSourceSignal?
     private var audioGeneration = 0
     private var audioTask: Task<Void, Never>?
+    private var nativeVolumeDevice: AudioDeviceID = 0
+    private var nativeVolumeListeners: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
     private struct DisplayControl: Hashable { let id: String; let feature: String }
     private var displayReadback: [String: Task<Void, Never>] = [:]
     private lazy var displayWrites = LatestValueQueue<DisplayControl> { [weak self] target, value in
@@ -59,6 +61,7 @@ final class ControlModel: ObservableObject {
         outputs = AudioControl.outputs(); defaultID = AudioControl.defaultOutput()
         if selected.isEmpty, let current = outputs.first(where: { $0.id == defaultID && !$0.isAggregate }) { selected.insert(current.uid) }
         recoverRouting()
+        observeNativeVolume()
         let savedTargets = outputs.filter { selected.contains($0.uid) && !$0.isAggregate }
         if selected.count <= 1, savedTargets.allSatisfy({ $0.volume != nil }),
            let current = outputs.first(where: { $0.id == defaultID && !$0.isAggregate }) {
@@ -100,6 +103,10 @@ final class ControlModel: ObservableObject {
         for task in displayReadback.values { task.cancel() }
         if let termination { NotificationCenter.default.removeObserver(termination) }
         terminationSignal?.cancel()
+        for (target, property, listener) in nativeVolumeListeners {
+            var address = property
+            _ = AudioObjectRemovePropertyListenerBlock(target, &address, .main, listener)
+        }
     }
 
     func poll() {
@@ -107,6 +114,7 @@ final class ControlModel: ObservableObject {
         writeKeyStatus()
         let previousDefault = defaultID
         outputs = AudioControl.outputs(); defaultID = AudioControl.defaultOutput()
+        observeNativeVolume()
         if (softwareAudioRunning || audioStarting), systemVolume.deviceID != 0, defaultID != systemVolume.deviceID {
             stopSoftwareAudio()
             if let output = outputs.first(where: { $0.id == defaultID && !$0.isAggregate }) {
@@ -231,7 +239,10 @@ final class ControlModel: ObservableObject {
         if output.volume != nil {
             do {
                 try AudioControl.setLevel(output.id, value: value, muted: value > 0 ? false : AudioControl.muted(output.id) ?? false)
-                pollAudio()
+                publishNativeLevel(output.id, value: value.clamped, muted: value > 0 ? false : output.muted)
+                if usesNativeVolumeKeys, output.id == defaultID {
+                    syncNativeVolume(value: value.clamped, muted: value > 0 ? false : output.muted)
+                }
             } catch { message = error.localizedDescription }
             return
         }
@@ -249,7 +260,53 @@ final class ControlModel: ObservableObject {
         }
         do { try AudioControl.setMute(output.id, muted: !(output.muted ?? false)); pollAudio() } catch { message = error.localizedDescription }
     }
-    func pollAudio() { outputs = AudioControl.outputs(); defaultID = AudioControl.defaultOutput() }
+    func pollAudio() {
+        outputs = AudioControl.outputs(); defaultID = AudioControl.defaultOutput()
+        observeNativeVolume()
+    }
+
+    private func publishNativeLevel(_ id: AudioDeviceID, value: Double, muted: Bool?) {
+        guard let index = outputs.firstIndex(where: { $0.id == id }) else { return }
+        let output = outputs[index]
+        outputs[index] = Output(id: output.id, uid: output.uid, name: output.name,
+                                volume: value, muted: muted, isAggregate: output.isAggregate)
+    }
+
+    private func observeNativeVolume() {
+        guard defaultID != nativeVolumeDevice else { return }
+        for (target, property, listener) in nativeVolumeListeners {
+            var address = property
+            _ = AudioObjectRemovePropertyListenerBlock(target, &address, .main, listener)
+        }
+        nativeVolumeListeners.removeAll()
+        nativeVolumeDevice = defaultID
+        let id = defaultID
+        guard id != 0 else { return }
+        for selector in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
+            for (target, property) in AudioControl.controlTargets(id, selector) {
+                var address = property
+                let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+                    MainActor.assumeIsolated {
+                        guard let self, self.nativeVolumeDevice == id,
+                              !self.softwareAudioRunning, !self.audioStarting,
+                              let value = AudioControl.volume(id) else { return }
+                        let muted = AudioControl.muted(id)
+                        // Our slider writes already published this level. Do
+                        // not reinterpret their hardware echo as a new master
+                        // value (especially with per-device calibration).
+                        if let output = self.outputs.first(where: { $0.id == id }),
+                           let displayed = output.volume,
+                           abs(displayed - value) < 0.001, output.muted == muted { return }
+                        self.publishNativeLevel(id, value: value, muted: muted)
+                        if self.usesNativeVolumeKeys { self.syncNativeVolume(value: value, muted: muted) }
+                    }
+                }
+                if AudioObjectAddPropertyListenerBlock(target, &address, .main, listener) == noErr {
+                    nativeVolumeListeners.append((target, address, listener))
+                }
+            }
+        }
+    }
     func routeTo(_ output: Output) {
         if softwareAudioRunning || audioStarting { stopSoftwareAudio() }
         if groupRunning && !stopGroup() { return }
@@ -306,7 +363,11 @@ final class ControlModel: ObservableObject {
         var unsupported: [String] = []
         for output in outputs where selected.contains(output.uid) || (selected.isEmpty && output.id == defaultID) {
             if output.volume != nil {
-                do { try AudioControl.setLevel(output.id, value: master * (calibrations[output.uid] ?? 1), muted: masterMuted) } catch { message = error.localizedDescription }
+                do {
+                    let value = (master * (calibrations[output.uid] ?? 1)).clamped
+                    try AudioControl.setLevel(output.id, value: value, muted: masterMuted)
+                    publishNativeLevel(output.id, value: value, muted: masterMuted)
+                } catch { message = error.localizedDescription }
             } else if !monitors.contains(where: { $0.name == output.name && linkedMonitors.contains($0.id) }) { unsupported.append(output.name) }
         }
         let targets = monitors.filter { linkedMonitors.contains($0.id) && ($0.volume != nil || $0.manual) }
@@ -315,7 +376,6 @@ final class ControlModel: ObservableObject {
         for target in targets {
             writeDisplay(target.id, feature: "volume", value: value * (calibrations["display.\(target.id)"] ?? 1))
         }
-        pollAudio()
     }
 
     func startGroup() {
@@ -602,6 +662,10 @@ final class ControlModel: ObservableObject {
                 let observed = AudioControl.volume(speaker.id) ?? -1
                 let expected = max(0.1, originalVolume * 0.8)
                 guard abs(observed - expected) < 0.01, AudioControl.defaultOutput() == speaker.id else { throw ControlError.message("MacBook yönlendirme/ses geri okuması başarısız.") }
+                guard abs(master - expected) < 0.01,
+                      abs((outputs.first(where: { $0.id == speaker.id })?.volume ?? -1) - expected) < 0.01 else {
+                    throw ControlError.message("Cihaz sürgüsü ortak sesi aynı işlemde güncellemedi.")
+                }
                 report.append("macbook_native_volume_and_route=PASS")
                 master = 0.35; masterMuted = false; applyMaster()
                 masterMuted = true; applyMaster(); poll()
@@ -609,10 +673,24 @@ final class ControlModel: ObservableObject {
                     throw ControlError.message("Ortak sessize alma, kayıtlı ses seviyesini korumadı.")
                 }
                 master = 0.4; masterMuted = false; applyMaster()
+                guard abs((outputs.first(where: { $0.id == speaker.id })?.volume ?? -1) - 0.4) < 0.01 else {
+                    throw ControlError.message("Ortak sürgü cihaz seviyesini aynı işlemde güncellemedi.")
+                }
                 guard AudioControl.muted(speaker.id) == false, abs((AudioControl.volume(speaker.id) ?? -1) - 0.4) < 0.01 else {
                     throw ControlError.message("Ortak ses sürgüsü donanım sessizliğini kaldırmadı.")
                 }
                 report.append("native_master_mute_poll_and_unmute=PASS")
+                try AudioControl.setLevel(speaker.id, value: 0.45, muted: false)
+                let notificationDeadline = ContinuousClock.now.advanced(by: .milliseconds(500))
+                while abs(master - 0.45) > 0.01, ContinuousClock.now < notificationDeadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                guard abs(master - 0.45) < 0.01,
+                      abs((outputs.first(where: { $0.id == speaker.id })?.volume ?? -1) - 0.45) < 0.01 else {
+                    throw ControlError.message("Sistem ses bildirimi iki saniyelik taramayı beklemeden yansımadı.")
+                }
+                report.append("native_slider_immediate_sync_and_notification=PASS")
+                master = 0.4; applyMaster()
 
             }
             if CommandLine.arguments.contains("--keep-route") {

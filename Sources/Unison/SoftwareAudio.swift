@@ -33,6 +33,8 @@ final class SoftwareAudio {
     var inputLayout: UInt32 { dsp.map { unison_dsp_input_layout($0) } ?? 0 }
     var outputLayout: UInt32 { dsp.map { unison_dsp_output_layout($0) } ?? 0 }
     var deliveredBlocks: [UInt32] { outputUIDs.indices.map { index in dsp.map { unison_dsp_device_signal_count($0, UInt32(index)) } ?? 0 } }
+    var inputPeak: Double { dsp.map { Double(unison_dsp_input_peak($0)) } ?? 0 }
+    var outputPeaks: [Double] { outputUIDs.indices.map { index in dsp.map { Double(unison_dsp_device_peak($0, UInt32(index))) } ?? 0 } }
 
     func start(outputs: [Output], calibration: [String: Double]) async throws {
         try Task.checkCancellation()
@@ -116,6 +118,15 @@ final class SoftwareAudio {
         return UnsafeMutableAudioBufferListPointer(memory.assumingMemoryBound(to: AudioBufferList.self)).reduce(0) { $0 + $1.mNumberChannels }
     }
     func gain(_ value: Double) { if let dsp { unison_dsp_set_gain(dsp, Float(value.clamped)) } }
+    // Diagnostic runs can isolate their tone from other apps playing audio.
+    func isolateCapture(processID: AudioObjectID) throws {
+        guard processID != 0, let session, let description = session.description else { throw ControlError.message("Test ses süreci bulunamadı.") }
+        description.processes = [processID]
+        description.isExclusive = false
+        var a = AudioControl.address(kAudioTapPropertyDescription)
+        var reference = Unmanaged.passUnretained(description)
+        try AudioControl.check(AudioObjectSetPropertyData(session.tap, &a, 0, nil, UInt32(MemoryLayout.size(ofValue: reference)), &reference))
+    }
     func activate(master: Double) throws {
         guard signalBlocks > 0, let session, let description = session.description else { throw ControlError.message("Ses akışı henüz doğrulanmadı.") }
         description.muteBehavior = .mutedWhenTapped

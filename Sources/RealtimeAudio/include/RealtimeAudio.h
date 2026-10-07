@@ -11,5 +11,7 @@ unsigned unison_dsp_signal_count(UnisonDSP *state);
 unsigned unison_dsp_input_layout(UnisonDSP *state);
 unsigned unison_dsp_device_signal_count(UnisonDSP *state, unsigned index);
 unsigned unison_dsp_output_layout(UnisonDSP *state);
+float unison_dsp_input_peak(UnisonDSP *state);
+float unison_dsp_device_peak(UnisonDSP *state, unsigned index);
 OSStatus unison_audio_callback(AudioObjectID device, const AudioTimeStamp * _Nonnull now, const AudioBufferList * _Nonnull input, const AudioTimeStamp * _Nonnull inputTime, AudioBufferList * _Nonnull output, const AudioTimeStamp * _Nonnull outputTime, void * _Nullable context);
 #pragma clang assume_nonnull end

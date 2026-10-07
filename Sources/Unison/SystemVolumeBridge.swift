@@ -5,12 +5,17 @@ import Foundation
 final class SystemVolumeBridge {
     private(set) var deviceID: AudioDeviceID = 0
     private(set) var uid = ""
-    var amplitude: Double { AudioControl.linearAmplitude(deviceID) ?? lastVolume }
+    var amplitude: Double {
+        if uid == "org.unison.output" { return AudioControl.volume(deviceID) ?? lastVolume }
+        return AudioControl.linearAmplitude(deviceID) ?? lastVolume
+    }
     private var previousID: AudioDeviceID = 0
     private var requestedRoute = false
     private var routeTransition: AudioRouteTransition?
     private var nativeLevels: [String: Double] = [:]
     private var nativeMutes: [String: Bool] = [:]
+    private var writtenLevels: [String: Double] = [:]
+    private var writtenMutes: [String: Bool] = [:]
     private var listeners: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
     private var lastVolume = 0.0
     private var lastMuted = false
@@ -26,7 +31,8 @@ final class SystemVolumeBridge {
         do {
             if uid == "org.unison.output" {
                 UserDefaults.standard.set(AudioControl.string(current, kAudioDevicePropertyDeviceUID), forKey: "unisonNamedPreviousOutput")
-                // Neutral hardware levels avoid applying the common volume twice.
+                // Preserve physical controls and use the same hardware volume
+                // path as a standalone native speaker.
                 for output in outputs where output.volume != nil && renderedUIDs.contains(output.uid) {
                     if let level = AudioControl.volume(output.id) { nativeLevels[output.uid] = level }
                     if let mute = AudioControl.muted(output.id) { nativeMutes[output.uid] = mute }
@@ -35,7 +41,11 @@ final class SystemVolumeBridge {
                 UserDefaults.standard.set(nativeLevels, forKey: "unisonNormalizedVolumes")
                 UserDefaults.standard.set(nativeMutes, forKey: "unisonNormalizedMutes")
                 for output in outputs where nativeLevels[output.uid] != nil {
-                    try AudioControl.setLevel(output.id, value: 1, muted: false)
+                    let level = nativeLevels[output.uid] ?? 1
+                    try AudioControl.setLevel(output.id, value: level, muted: false)
+                    writtenLevels[output.uid] = level; writtenMutes[output.uid] = false
+                    UserDefaults.standard.set(writtenLevels, forKey: "unisonWrittenNativeVolumes")
+                    UserDefaults.standard.set(writtenMutes, forKey: "unisonWrittenNativeMutes")
                 }
             }
             requestedRoute = current != deviceID
@@ -69,6 +79,23 @@ final class SystemVolumeBridge {
         routeTransition?.isPending(current: current) ?? false
     }
 
+    func applyNativeLevels(outputs: [Output], master: Double, muted: Bool, gains: [String: Double], deviceMutes: Set<String>, calibrations: [String: Double]) throws {
+        guard uid == "org.unison.output" else { return }
+        for output in outputs where nativeLevels[output.uid] != nil {
+            let level = (master * (gains[output.uid] ?? 1) * (calibrations[output.uid] ?? 1)).clamped
+            let silent = muted || deviceMutes.contains(output.uid)
+            let hardwareLevel = silent && output.muted == nil ? 0 : level
+            guard writtenLevels[output.uid] != hardwareLevel || writtenMutes[output.uid] != silent else { continue }
+            try AudioControl.setLevel(output.id, value: level, muted: silent)
+            writtenLevels[output.uid] = AudioControl.volume(output.id) ?? hardwareLevel
+            writtenMutes[output.uid] = AudioControl.muted(output.id) ?? silent
+            UserDefaults.standard.set(writtenLevels, forKey: "unisonWrittenNativeVolumes")
+            UserDefaults.standard.set(writtenMutes, forKey: "unisonWrittenNativeMutes")
+        }
+    }
+
+    func controlsNativeLevel(_ outputUID: String) -> Bool { nativeLevels[outputUID] != nil }
+
     private func readChange() {
         guard deviceID != 0, let volume = AudioControl.volume(deviceID) else { return }
         let muted = AudioControl.muted(deviceID) ?? false
@@ -84,21 +111,25 @@ final class SystemVolumeBridge {
             _ = AudioObjectRemovePropertyListenerBlock(target, &address, .main, listener)
         }
         listeners.removeAll()
+        let physical = AudioControl.outputs()
         for (savedUID, level) in nativeLevels {
-            if let device = AudioControl.outputs().first(where: { $0.uid == savedUID }), let current = AudioControl.volume(device.id), abs(current - 1) < 0.001 {
+            if let written = writtenLevels[savedUID], let device = physical.first(where: { $0.uid == savedUID }), let current = AudioControl.volume(device.id), abs(current - written) < 0.001 {
                 try? AudioControl.setVolume(device.id, value: level)
             }
         }
-        for (savedUID, muted) in nativeMutes where muted {
-            if let device = AudioControl.outputs().first(where: { $0.uid == savedUID }), AudioControl.muted(device.id) == false {
-                try? AudioControl.setMute(device.id, muted: true)
+        for (savedUID, muted) in nativeMutes {
+            if let written = writtenMutes[savedUID], let device = physical.first(where: { $0.uid == savedUID }), AudioControl.muted(device.id) == written, muted != written {
+                try? AudioControl.setMute(device.id, muted: muted)
             }
         }
         nativeLevels.removeAll()
         nativeMutes.removeAll()
+        writtenLevels.removeAll(); writtenMutes.removeAll()
         if uid == "org.unison.output" {
             UserDefaults.standard.removeObject(forKey: "unisonNormalizedVolumes")
             UserDefaults.standard.removeObject(forKey: "unisonNormalizedMutes")
+            UserDefaults.standard.removeObject(forKey: "unisonWrittenNativeVolumes")
+            UserDefaults.standard.removeObject(forKey: "unisonWrittenNativeMutes")
         }
         let current = AudioControl.defaultOutput()
         // Some routes switch asynchronously. Cancel our pending request even if
@@ -138,5 +169,14 @@ enum LinkedVolumeGain {
     static func device(master: Double, relative: Double, calibration: Double, isSystemDevice: Bool, muted: Bool, systemAmplitude: Double? = nil) -> Double {
         guard !muted, master > 0 else { return 0 }
         return ((isSystemDevice ? 1 : systemAmplitude ?? master) * relative * calibration).clamped
+    }
+}
+
+// Hardware controls carry the complete master/relative/calibration level.
+// Outputs without them, including HDMI, receive that level in DSP instead.
+enum NamedOutputGain {
+    static func device(master: Double, relative: Double, calibration: Double, hardwareControlled: Bool, muted: Bool) -> Double {
+        guard !muted, master > 0, relative > 0, calibration > 0 else { return 0 }
+        return hardwareControlled ? 1 : (master * relative * calibration).clamped
     }
 }

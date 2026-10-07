@@ -418,20 +418,24 @@ final class ControlModel: ObservableObject {
 
     private func recoverRouting() {
         if let levels = defaults.dictionary(forKey: "unisonNormalizedVolumes") as? [String: Double] {
+            let written = defaults.dictionary(forKey: "unisonWrittenNativeVolumes") as? [String: Double] ?? [:]
             for (uid, level) in levels {
-                if let output = outputs.first(where: { $0.uid == uid }), let current = AudioControl.volume(output.id), abs(current - 1) < 0.001 {
+                if let output = outputs.first(where: { $0.uid == uid }), let current = AudioControl.volume(output.id), abs(current - (written[uid] ?? 1)) < 0.001 {
                     try? AudioControl.setVolume(output.id, value: level)
                 }
             }
             defaults.removeObject(forKey: "unisonNormalizedVolumes")
+            defaults.removeObject(forKey: "unisonWrittenNativeVolumes")
         }
         if let mutes = defaults.dictionary(forKey: "unisonNormalizedMutes") as? [String: Bool] {
-            for (uid, muted) in mutes where muted {
-                if let output = outputs.first(where: { $0.uid == uid }), AudioControl.muted(output.id) == false {
-                    try? AudioControl.setMute(output.id, muted: true)
+            let written = defaults.dictionary(forKey: "unisonWrittenNativeMutes") as? [String: Bool] ?? [:]
+            for (uid, muted) in mutes {
+                if let output = outputs.first(where: { $0.uid == uid }), AudioControl.muted(output.id) == (written[uid] ?? false) {
+                    try? AudioControl.setMute(output.id, muted: muted)
                 }
             }
             defaults.removeObject(forKey: "unisonNormalizedMutes")
+            defaults.removeObject(forKey: "unisonWrittenNativeMutes")
         }
         if AudioControl.string(defaultID, kAudioDevicePropertyDeviceUID) == "org.unison.output" {
             let previous = defaults.string(forKey: "unisonNamedPreviousOutput")
@@ -579,7 +583,16 @@ final class ControlModel: ObservableObject {
     }
     private func updateSoftwareGains() {
         guard softwareAudioRunning else { softwareAudio.gain(0); return }
-        if systemVolume.deviceID == 0 {
+        if systemVolume.uid == "org.unison.output" {
+            softwareAudio.gain(masterMuted ? 0 : 1)
+            do { try systemVolume.applyNativeLevels(outputs: outputs, master: master, muted: masterMuted, gains: deviceGains, deviceMutes: deviceMuted, calibrations: calibrations) }
+            catch { message = error.localizedDescription }
+            for uid in softwareAudio.outputUIDs {
+                let relative = deviceMuted.contains(uid) ? 0 : deviceGains[uid] ?? 1
+                let gain = NamedOutputGain.device(master: master, relative: relative, calibration: calibrations[uid] ?? 1, hardwareControlled: systemVolume.controlsNativeLevel(uid), muted: masterMuted)
+                softwareAudio.deviceGain(uid, value: gain)
+            }
+        } else if systemVolume.deviceID == 0 {
             softwareAudio.gain(masterMuted ? 0 : master)
             for uid in softwareAudio.outputUIDs { softwareAudio.deviceGain(uid, value: deviceMuted.contains(uid) ? 0 : (deviceGains[uid] ?? 1) * (calibrations[uid] ?? 1)) }
         } else {
@@ -648,6 +661,19 @@ final class ControlModel: ObservableObject {
             if let png = bitmap.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: path)); print("Arayüz önizlemesi: \(path)") }
         }
         NSApp.terminate(nil)
+    }
+
+    private func testAmplitudes(expected: [Double]) async throws -> (Double, [Double]) {
+        var input = 0.0
+        var output: [Double] = []
+        let ready = try await AudioReadiness.wait(timeout: .seconds(2)) {
+            input = self.softwareAudio.inputPeak
+            output = self.softwareAudio.outputPeaks
+            let tonePeak = 1600.0 / 32768.0
+            return abs(input - tonePeak) < 0.002 && output.count == expected.count && zip(output, expected).allSatisfy { abs($0.0 / input - $0.1) < 0.015 }
+        }
+        guard ready else { throw ControlError.message("Test sesinin genliği beklenen düzeye ulaşmadı: giriş=\(input), çıkış=\(output), oran=\(expected).") }
+        return (input, output)
     }
     private func audioSmoke() async {
         let previous = AudioControl.defaultOutput()
@@ -768,6 +794,22 @@ final class ControlModel: ObservableObject {
                 throw ControlError.message("Çıkışlara ses yazılmadı: callback=\(softwareAudio.callbacks), motor=\(softwareAudio.isRunning), varsayılan=\(AudioControl.defaultOutput()), denetleyici=\(systemVolume.deviceID), ortak ses=\(master), sistem seviyesi=\(AudioControl.volume(systemVolume.deviceID) ?? -1), sistem kazancı=\(systemVolume.amplitude), sistem sessiz=\(AudioControl.muted(systemVolume.deviceID).map(String.init) ?? "yok"), sessiz=\(masterMuted), durum=\(message), kaynak=\(source.isRunning).")
             }
             report.append("both_outputs=PASS")
+            var processAddress = AudioControl.address(kAudioHardwarePropertyTranslatePIDToProcessObject)
+            var sourcePID = source.processIdentifier, sourceID: AudioObjectID = 0, processSize: UInt32 = 4
+            try AudioControl.check(AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &processAddress, 4, &sourcePID, &processSize, &sourceID))
+            try softwareAudio.isolateCapture(processID: sourceID)
+            for level in [0.66, 1.0] {
+                master = level; masterMuted = false; applyMaster()
+                let (input, outputPeaks) = try await testAmplitudes(expected: physical.map { $0.volume != nil ? 1 : level })
+                report.append("amplitude_\(level): input=\(input) outputs=\(outputPeaks) control=\(systemVolume.amplitude)")
+                for output in physical {
+                    if output.volume != nil, abs((AudioControl.volume(output.id) ?? -1) - level) > 0.01 {
+                        throw ControlError.message("\(output.name) yerel ses seviyesi çoklu çıkışta değişti.")
+                    }
+                }
+            }
+            report.append("native_volume_parity_and_hdmi_linear_gain=PASS")
+            master = 0.5; applyMaster()
             if softwareAudioRunning, let speaker {
                 let systemControlID = systemVolume.deviceID
                 let nativeBefore = AudioControl.volume(systemControlID)
@@ -813,6 +855,7 @@ final class ControlModel: ObservableObject {
             guard softwareAudio.deliveredBlocks == muteBefore else { throw ControlError.message("Ortak sessize alma başarısız.") }
             report.append("master_mute=PASS")
             if let speaker, let hdmi = physical.first(where: { $0.volume == nil }) {
+                master = 0.66
                 masterMuted = false
                 deviceGains[speaker.uid] = 1
                 applyMaster()
@@ -831,6 +874,9 @@ final class ControlModel: ObservableObject {
                     guard softwareAudio.deliveredBlocks[0] > deliveredBefore else {
                         throw ControlError.message("Tek HDMI akışı geçişten sonra durdu.")
                     }
+                    try softwareAudio.isolateCapture(processID: sourceID)
+                    let (input, output) = try await testAmplitudes(expected: [master])
+                    report.append("single_hdmi_gain_\(pass)=\(output[0] / input)")
                     report.append("multi_to_single_hdmi_\(pass)=PASS")
                     toggleOutput(speaker, enabled: true)
                     let multiDeadline = ContinuousClock.now.advanced(by: .seconds(5))
@@ -871,7 +917,8 @@ final class ControlModel: ObservableObject {
                         let bridge = SystemVolumeBridge()
                         defer { bridge.stop() }
                         try bridge.start(outputs: physical, value: 0.4, muted: false, preferNamedOutput: true, renderedUIDs: [speaker.uid]) { _, _ in }
-                        guard AudioControl.muted(speaker.id) == false, abs((AudioControl.volume(speaker.id) ?? -1) - 1) < 0.01 else {
+                        try bridge.applyNativeLevels(outputs: physical, master: 0.6, muted: false, gains: [:], deviceMutes: [], calibrations: [:])
+                        guard AudioControl.muted(speaker.id) == false, abs((AudioControl.volume(speaker.id) ?? -1) - 0.6) < 0.01 else {
                             throw ControlError.message("Yazılımsal çıkışın donanım sessizliği kaldırılmadı.")
                         }
                     }
@@ -881,7 +928,7 @@ final class ControlModel: ObservableObject {
                         throw ControlError.message("Yazılımsal çıkış geri yüklemesi: ses=\(AudioControl.volume(speaker.id) ?? -1), sessiz=\(AudioControl.muted(speaker.id).map(String.init) ?? "yok"), çıkış=\(AudioControl.defaultOutput()), beklenen=\(bridgePrevious).")
                     }
                     try AudioControl.setMute(speaker.id, muted: false)
-                    report.append("normalized_hardware_mute_and_restore=PASS")
+                    report.append("native_hardware_level_mute_and_restore=PASS")
                 }
             }
         } catch { report.append("ERROR=\(error.localizedDescription)") }

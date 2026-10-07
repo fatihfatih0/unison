@@ -12,11 +12,13 @@ struct UnisonDSP {
     _Atomic unsigned outputLayout;
     _Atomic unsigned deviceSignalBlocks[16];
     _Atomic float deviceGain[16];
+    _Atomic float inputPeak;
+    _Atomic float devicePeak[16];
     unsigned channels[16]; // Set before AudioDeviceStart; immutable while running.
 };
 UnisonDSP *unison_dsp_create(void) {
     UnisonDSP *s = calloc(1, sizeof(*s));
-    if (s) { atomic_init(&s->gain, 1); atomic_init(&s->callbacks, 0); atomic_init(&s->signalBlocks, 0); atomic_init(&s->inputLayout, 0); atomic_init(&s->outputLayout, 0); for (int i=0; i<16; i++) { atomic_init(&s->deviceGain[i], 1); atomic_init(&s->deviceSignalBlocks[i], 0); } if (!atomic_is_lock_free(&s->gain)) { free(s); return NULL; } }
+    if (s) { atomic_init(&s->gain, 1); atomic_init(&s->callbacks, 0); atomic_init(&s->signalBlocks, 0); atomic_init(&s->inputLayout, 0); atomic_init(&s->outputLayout, 0); atomic_init(&s->inputPeak, 0); for (int i=0; i<16; i++) { atomic_init(&s->deviceGain[i], 1); atomic_init(&s->deviceSignalBlocks[i], 0); atomic_init(&s->devicePeak[i], 0); } if (!atomic_is_lock_free(&s->gain)) { free(s); return NULL; } }
     return s;
 }
 void unison_dsp_destroy(UnisonDSP *s) { free(s); }
@@ -33,12 +35,19 @@ void unison_dsp_render(UnisonDSP *s, const AudioBufferList *input, AudioBufferLi
     atomic_store_explicit(&s->inputLayout, ((input ? input->mNumberBuffers : 0) << 16) | (source ? source->mNumberChannels : 0), memory_order_relaxed);
     unsigned inputFrames = source && source->mData && source->mNumberChannels == 2 ? source->mDataByteSize / (2 * sizeof(float)) : 0;
     const float *samples = inputFrames ? source->mData : NULL;
+    float inputPeak = 0;
+    for (unsigned i=0; i<inputFrames * 2; i++) {
+        float value = fabsf(samples[i]);
+        if (value > inputPeak) inputPeak = value;
+    }
+    atomic_store_explicit(&s->inputPeak, inputPeak, memory_order_relaxed);
     for (unsigned i=0; i<inputFrames * 2; i++) {
         if (fabsf(samples[i]) > 0.00001f) { atomic_fetch_add_explicit(&s->signalBlocks, 1, memory_order_relaxed); break; }
     }
     float master = atomic_load_explicit(&s->gain, memory_order_relaxed);
     unsigned channelOffset = 0;
     bool hasSignal[16] = {false};
+    float peaks[16] = {0};
     for (unsigned b=0; b<output->mNumberBuffers; b++) {
         AudioBuffer *buffer = &output->mBuffers[b];
         if (!buffer->mData || !buffer->mNumberChannels) { channelOffset += buffer->mNumberChannels; continue; }
@@ -56,14 +65,20 @@ void unison_dsp_render(UnisonDSP *s, const AudioBufferList *input, AudioBufferLi
             for (unsigned frame=0; frame<frames; frame++) {
                 float value = samples[frame * 2 + sourceChannel] * gain;
                 dest[frame * buffer->mNumberChannels + ch] = value;
+                if (fabsf(value) > peaks[device]) peaks[device] = fabsf(value);
                 if (fabsf(value) > 0.00001f) hasSignal[device] = true;
             }
         }
         channelOffset += buffer->mNumberChannels;
     }
     atomic_store_explicit(&s->outputLayout, (output->mNumberBuffers << 16) | channelOffset, memory_order_relaxed);
-    for (unsigned device=0; device<16; device++) if (hasSignal[device]) atomic_fetch_add_explicit(&s->deviceSignalBlocks[device], 1, memory_order_relaxed);
+    for (unsigned device=0; device<16; device++) {
+        atomic_store_explicit(&s->devicePeak[device], peaks[device], memory_order_relaxed);
+        if (hasSignal[device]) atomic_fetch_add_explicit(&s->deviceSignalBlocks[device], 1, memory_order_relaxed);
+    }
 }
+float unison_dsp_input_peak(UnisonDSP *s) { return atomic_load_explicit(&s->inputPeak, memory_order_relaxed); }
+float unison_dsp_device_peak(UnisonDSP *s, unsigned index) { return index < 16 ? atomic_load_explicit(&s->devicePeak[index], memory_order_relaxed) : 0; }
 unsigned unison_dsp_callback_count(UnisonDSP *s) { return atomic_load_explicit(&s->callbacks, memory_order_relaxed); }
 unsigned unison_dsp_signal_count(UnisonDSP *s) { return atomic_load_explicit(&s->signalBlocks, memory_order_relaxed); }
 unsigned unison_dsp_input_layout(UnisonDSP *s) { return atomic_load_explicit(&s->inputLayout, memory_order_relaxed); }

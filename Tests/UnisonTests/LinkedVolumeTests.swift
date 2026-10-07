@@ -2,6 +2,17 @@ import XCTest
 @testable import Unison
 
 final class LinkedVolumeTests: XCTestCase {
+    func testNamedOutputNeverAppliesHardwareVolumeTwice() {
+        XCTAssertEqual(NamedOutputGain.device(master: 0.66, relative: 0.8, calibration: 0.5, hardwareControlled: true, muted: false), 1)
+        XCTAssertEqual(NamedOutputGain.device(master: 0.66, relative: 0.8, calibration: 0.5, hardwareControlled: false, muted: false), 0.264, accuracy: 0.00001)
+    }
+    func testNamedOutputMuteAndZeroSilenceHardwareAndHDMI() {
+        for hardware in [true, false] {
+            XCTAssertEqual(NamedOutputGain.device(master: 0.66, relative: 1, calibration: 1, hardwareControlled: hardware, muted: true), 0)
+            XCTAssertEqual(NamedOutputGain.device(master: 0.66, relative: 0, calibration: 1, hardwareControlled: hardware, muted: false), 0)
+            XCTAssertEqual(NamedOutputGain.device(master: 0, relative: 1, calibration: 1, hardwareControlled: hardware, muted: false), 0)
+        }
+    }
     func testCommonVolumeIsAppliedExactlyOnceToSystemSpeaker() {
         let master = 0.4
         let systemGain = LinkedVolumeGain.device(master: master, relative: 0.8, calibration: 0.5, isSystemDevice: true, muted: false)

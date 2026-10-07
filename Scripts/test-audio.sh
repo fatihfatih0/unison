@@ -9,7 +9,7 @@ with wave.open('/tmp/unison-test-tone.wav', 'wb') as f:
     f.setsampwidth(2)
     f.setframerate(48000)
     f.writeframes(b''.join(struct.pack('<hh', v, v)
-        for i in range(48000 * 20)
+        for i in range(48000 * 30)
         for v in [int(1600 * math.sin(2 * math.pi * 440 * i / 48000))]))
 PY
 report="$PWD/build/audio-regression.txt"

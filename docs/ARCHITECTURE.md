@@ -19,7 +19,7 @@ The audio engine starts without muting the source. It activates forwarding only 
 
 Aggregate stream readiness is polled asynchronously on the main actor with a 500 ms deadline. Each startup owns its tap, aggregate and DSP resources; cancellation or a newer session prevents a suspended startup from registering a callback or cleaning up the replacement session. Stopping the engine cancels pending readiness/activation work. Realtime output channels outside the configured device layout remain silent.
 
-The virtual driver exposes an output and a clock; it does not forward audio by itself. The app forwards captured audio to physical outputs. System volume changes update DSP gains; physical outputs used by the named bridge are normalized temporarily and restored on shutdown. Normal exit restores the previous route. After a forced termination, reopening attempts recovery.
+The virtual driver exposes an output and a clock; it does not forward audio by itself. The app forwards captured audio to physical outputs. With the named endpoint, native speakers apply the shared level through their hardware volume controls and DSP passes their samples without a second gain. HDMI outputs apply the shared scalar level in DSP. The virtual endpoint's nominal dB curve is not used for physical attenuation. Normal exit restores physical levels, mute settings and the previous route. After a forced termination, reopening attempts recovery.
 
 Audio is processed in local memory, without recording or uploading. Preferences store device IDs and levels. There is no telemetry. DDC and built-in brightness use private Apple interfaces, so OS changes may affect support.
 

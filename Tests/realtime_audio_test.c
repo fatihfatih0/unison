@@ -21,6 +21,7 @@ static void test_sixteen_devices(void) {
     }
     output->mNumberBuffers = 16;
     unison_dsp_render(state, &input, output);
+    assert(unison_dsp_input_peak(state) == 1);
     for (unsigned device=0; device<16; device++) {
         unsigned channels = output->mBuffers[device].mNumberChannels;
         float gain = (device + 1) / 16.0f;
@@ -30,6 +31,7 @@ static void test_sixteen_devices(void) {
             }
         }
         assert(unison_dsp_device_signal_count(state, device) == 1);
+        assert(unison_dsp_device_peak(state, device) == gain);
     }
     assert(destination[14][0] != destination[15][0]);
     unison_dsp_set_device(state, 15, 0, 0);

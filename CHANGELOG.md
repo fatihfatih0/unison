@@ -18,7 +18,9 @@
 - Shared mute preserves the native volume level; raising volume clears hardware mute.
 - Native output selection follows changes made in macOS Sound settings.
 - Slow DDC writes are verified after the final queued value; hardware brightness clears software dimming.
-- Physical volume and mute settings are saved before normalization and restored on exit/recovery.
+- Native speakers retain their hardware volume curve in multi-output mode; HDMI applies the shared scalar level once in DSP.
+- Physical volume and mute settings are saved before processing and restored on exit/recovery.
+- Audio regression checks measure isolated tone amplitudes, native volume parity and HDMI-only gain after multi-output transitions.
 - Optional Unison HAL audio output and installer.
 - English README and installation documentation, plus local/CI tests.
 

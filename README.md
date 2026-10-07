@@ -6,13 +6,13 @@ Unison is a free, open-source macOS menu bar app for HDMI volume control, extern
 
 [Install](#install) · [Setup guide](docs/INSTALL.md) · [MIT license](LICENSE)
 
-<p align="center"><img src="Assets/README/panel.png" width="280" alt="Unison volume and brightness panel"></p>
+<p align="center"><img src="Assets/README/panel.png" width="260" alt="Unison shared controls and sound outputs"> <img src="Assets/README/displays.png" width="260" alt="Unison shared controls and individual display brightness"></p>
 
 ## What you can do
 
 - Play through selected speakers together and adjust each output separately.
 - Control built-in and external display brightness, with software dimming when DDC is unavailable.
-- Drag the sliders, scroll the mouse wheel over them, or swipe horizontally with two fingers.
+- Drag the sliders, scroll the mouse wheel over them, swipe horizontally with two fingers, or focus a slider and use the arrow keys.
 - Adjust shared volume with media keys and macOS Control Center.
 - Remember your devices and start at login. Audio stays on your Mac.
 
@@ -29,7 +29,7 @@ No release package yet? Download or clone the source, install Xcode 26 or newer 
 open "$(cat build/latest-installer-path.txt)"
 ```
 
-Open the **U** menu icon, select your speakers and displays, and play audio. The top sliders control selected devices together; each device has its own slider.
+Open the **U** menu icon and select your devices in **Sound outputs (Ses çıkışları)** and **Displays (Ekranlar)**. Play audio. The top sliders control selected devices together; each device has its own slider. Blue controls adjust sound, amber controls adjust brightness.
 
 ## Good to know
 

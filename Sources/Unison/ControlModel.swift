@@ -555,7 +555,9 @@ final class ControlModel: ObservableObject {
 
     private func exportPreview(_ path: String) {
         // Render our own SwiftUI view as an artifact, without taking a desktop screenshot.
-        let view = NSHostingView(rootView: ControlPanel(model: self))
+        let panel = ControlPanel(model: self, showingDisplays: CommandLine.arguments.contains("--preview-displays"), expandedDetails: CommandLine.arguments.contains("--preview-details"))
+        let content = CommandLine.arguments.contains("--preview-settings") ? AnyView(panel.settingsPanel) : AnyView(panel)
+        let view = NSHostingView(rootView: content.environment(\.unisonPreviewReduceMotion, CommandLine.arguments.contains("--preview-reduced-motion")))
         let size = view.fittingSize
         view.frame = NSRect(origin: .zero, size: size)
         view.layoutSubtreeIfNeeded()
@@ -635,25 +637,35 @@ final class ControlModel: ObservableObject {
             source.arguments = ["/tmp/unison-test-tone.wav"]
             source.standardOutput = sourceLog; source.standardError = sourceLog
             try source.run(); sound = source
-            let deadline = Date().addingTimeInterval(2)
+            let sourceStarted = Date()
+            let deadline = sourceStarted.addingTimeInterval(5)
             while softwareAudio.signalBlocks == 0 && Date() < deadline { try? await Task.sleep(for: .milliseconds(20)) }
             guard softwareAudio.signalBlocks > 0 else {
                 let log = source.isRunning ? "çalışıyor" : String(data: sourceLog.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
                 throw ControlError.message("Ses kaynağı alınamadı: callback=\(softwareAudio.callbacks), giriş=\(softwareAudio.inputLayout), motor=\(softwareAudio.isRunning), bekleniyor=\(audioStarting), varsayılan=\(AudioControl.defaultOutput()), denetleyici=\(systemVolume.deviceID), durum=\(message), kaynak=\(source.isRunning), kayıt=\(log).")
             }
+            report.append("first_input_after_ms=\(Int(Date().timeIntervalSince(sourceStarted) * 1000))")
             report.append("before_activation_layout=\(softwareAudio.outputLayout)")
             if CommandLine.arguments.contains("--selection-smoke") {
-                while audioStarting && Date() < deadline { try? await Task.sleep(for: .milliseconds(20)) }
+                let activationDeadline = Date().addingTimeInterval(2)
+                while audioStarting && Date() < activationDeadline { try? await Task.sleep(for: .milliseconds(20)) }
                 guard softwareAudioRunning else { throw ControlError.message("Seçimden başlatılan motor etkinleşmedi.") }
                 report.append("selection_starts_multi_output=PASS")
             } else { try softwareAudio.activate(master: 0.5) }
             try? await Task.sleep(for: .milliseconds(400))
+            // Native routes settle asynchronously. Verify forwarding readiness
+            // within a bounded deadline instead of assuming a fixed 400 ms.
+            let forwardingDeadline = Date().addingTimeInterval(2)
+            while softwareAudio.deliveredBlocks.contains(0) && Date() < forwardingDeadline {
+                try await Task.sleep(for: .milliseconds(20))
+            }
             report.append("input_signals_after_activation=\(softwareAudio.signalBlocks)")
+            report.append("forwarding_ready_after_ms=\(Int(Date().timeIntervalSince(sourceStarted) * 1000))")
             let both = softwareAudio.deliveredBlocks
             report.append("output_layout=\(softwareAudio.outputLayout >> 16)buffers/\(softwareAudio.outputLayout & 0xffff)channels")
             report.append("output_signal_blocks=\(both)")
             guard both.count == physical.count, both.allSatisfy({ $0 > 0 }) else {
-                throw ControlError.message("Çıkışlara ses yazılmadı: callback=\(softwareAudio.callbacks), motor=\(softwareAudio.isRunning), varsayılan=\(AudioControl.defaultOutput()), denetleyici=\(systemVolume.deviceID), ortak ses=\(master), sessiz=\(masterMuted), durum=\(message), kaynak=\(source.isRunning).")
+                throw ControlError.message("Çıkışlara ses yazılmadı: callback=\(softwareAudio.callbacks), motor=\(softwareAudio.isRunning), varsayılan=\(AudioControl.defaultOutput()), denetleyici=\(systemVolume.deviceID), ortak ses=\(master), sistem seviyesi=\(AudioControl.volume(systemVolume.deviceID) ?? -1), sistem kazancı=\(systemVolume.amplitude), sistem sessiz=\(AudioControl.muted(systemVolume.deviceID).map(String.init) ?? "yok"), sessiz=\(masterMuted), durum=\(message), kaynak=\(source.isRunning).")
             }
             report.append("both_outputs=PASS")
             if softwareAudioRunning, let speaker {

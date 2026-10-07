@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VolumeCheckControl}",
+            "name": "Debug Unison",
+            "target": "Unison",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Unison"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:VolumeCheckControl}",
+            "name": "Release Unison",
+            "target": "Unison",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Unison"
+        }
+    ]
+}

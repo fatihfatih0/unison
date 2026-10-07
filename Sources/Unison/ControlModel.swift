@@ -537,6 +537,9 @@ final class ControlModel: ObservableObject {
     }
     func brightnessValue(_ monitor: Monitor) -> Double { monitor.brightness ?? softwareBrightness[monitor.id] ?? 1 }
     func setBrightness(_ monitor: Monitor, value: Double) {
+        setBrightness(monitor, value: value, updateShared: true)
+    }
+    private func setBrightness(_ monitor: Monitor, value: Double, updateShared: Bool) {
         if monitor.builtIn {
             do {
                 try NativeBrightness.write(monitor.displayID, value: value)
@@ -547,10 +550,20 @@ final class ControlModel: ObservableObject {
             writeDisplay(monitor.id, feature: "luminance", value: value)
         }
         else { setSoftwareBrightness(monitor.id, value: value) }
+        // Only an explicit device-slider edit updates the shared indicator.
+        // Native F1/F2 polling deliberately remains independent.
+        if updateShared, selectedDisplays.contains(monitor.id) {
+            let targets = monitors.filter { selectedDisplays.contains($0.id) }
+            if !targets.isEmpty {
+                masterBrightness = targets.reduce(0) { total, target in
+                    total + (target.id == monitor.id ? value.clamped : brightnessValue(target))
+                } / Double(targets.count)
+            }
+        }
     }
     func applyBrightness(_ value: Double) {
         masterBrightness = value.clamped
-        for monitor in monitors where selectedDisplays.contains(monitor.id) { setBrightness(monitor, value: value) }
+        for monitor in monitors where selectedDisplays.contains(monitor.id) { setBrightness(monitor, value: value, updateShared: false) }
     }
 
     private func exportPreview(_ path: String) {

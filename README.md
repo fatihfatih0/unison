@@ -39,13 +39,16 @@ Keep the app running while its **Unison** virtual output is selected. Current bu
 
 ## Common questions
 
-**Can I change HDMI monitor volume when macOS disables the volume controls?**  
+**Can I change HDMI monitor volume when macOS disables the volume controls?**
+
 Yes. With system audio capture allowed, Unison processes the audio locally and applies software volume to the selected HDMI output. The included virtual output connects shared volume to macOS Control Center and volume keys.
 
-**Can I play audio through my MacBook speakers and an HDMI monitor together?**  
+**Can I play audio through my MacBook speakers and an HDMI monitor together?**
+
 Yes. Select both physical outputs in the panel. Use the top volume slider for shared volume and each output's slider for its own level or mute. Different devices may have different playback latency.
 
-**Does Unison change an external monitor's actual backlight brightness?**  
+**Does Unison change an external monitor's actual backlight brightness?**
+
 On compatible monitors and connections, DDC changes hardware brightness. Otherwise, software dimming changes the displayed image while leaving the physical backlight unchanged. Built-in Mac display brightness is controlled separately.
 
 ## Contribute

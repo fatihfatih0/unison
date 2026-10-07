@@ -6,6 +6,7 @@
 - Refined compact panel with sound/display tabs, visible percentages, selection marks and consistent blue/amber controls.
 - Sliders support keyboard arrows, visible focus and reduced-motion preferences.
 - Native output and shared volume sliders update together immediately; system volume notifications replace waiting for the device polling cycle.
+- Pending macOS output routing gets a bounded grace period; regression checks exercise repeated multi-output / HDMI-only transitions.
 - HDMI and simultaneous audio through a local Core Audio Process Tap.
 - Aggregate stream readiness uses cancellable asynchronous polling; stopping/restarting retires pending startup safely.
 - DSP tests cover all 16 outputs, independent gains/mute and silent unconfigured channels.

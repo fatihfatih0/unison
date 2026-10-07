@@ -8,6 +8,7 @@ final class SystemVolumeBridge {
     var amplitude: Double { AudioControl.linearAmplitude(deviceID) ?? lastVolume }
     private var previousID: AudioDeviceID = 0
     private var requestedRoute = false
+    private var routeTransition: AudioRouteTransition?
     private var nativeLevels: [String: Double] = [:]
     private var nativeMutes: [String: Bool] = [:]
     private var listeners: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
@@ -41,6 +42,7 @@ final class SystemVolumeBridge {
             // Reassert the controller after creating the processing aggregate:
             // Bluetooth can complete an older route request during setup.
             try AudioControl.setDefault(deviceID)
+            routeTransition = AudioRouteTransition(previous: current, target: deviceID)
             try write(value: value, muted: muted)
             self.changed = changed
             for selector in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
@@ -61,6 +63,10 @@ final class SystemVolumeBridge {
         try AudioControl.setLevel(deviceID, value: value, muted: muted)
         lastVolume = AudioControl.volume(deviceID) ?? value
         lastMuted = AudioControl.muted(deviceID) ?? muted
+    }
+
+    func isWaitingForRoute(_ current: AudioDeviceID) -> Bool {
+        routeTransition?.isPending(current: current) ?? false
     }
 
     private func readChange() {
@@ -102,7 +108,27 @@ final class SystemVolumeBridge {
             try? AudioControl.setDefault(previousID)
         }
         if uid == "org.unison.output" { UserDefaults.standard.removeObject(forKey: "unisonNamedPreviousOutput") }
-        deviceID = 0; previousID = 0; requestedRoute = false; uid = ""
+        deviceID = 0; previousID = 0; requestedRoute = false; routeTransition = nil; uid = ""
+    }
+}
+
+// HAL may keep reporting the previous output after accepting setDefault.
+// Only that pending route gets a short grace period; unrelated user-selected
+// outputs and completed transitions must still stop the processing engine.
+struct AudioRouteTransition {
+    let previous: AudioDeviceID
+    let target: AudioDeviceID
+    private let deadline: ContinuousClock.Instant
+    private var completed = false
+
+    init(previous: AudioDeviceID, target: AudioDeviceID, now: ContinuousClock.Instant = .now) {
+        self.previous = previous; self.target = target
+        deadline = now.advanced(by: .seconds(3))
+    }
+
+    mutating func isPending(current: AudioDeviceID, now: ContinuousClock.Instant = .now) -> Bool {
+        if current == target { completed = true }
+        return !completed && previous != target && current == previous && now < deadline
     }
 }
 

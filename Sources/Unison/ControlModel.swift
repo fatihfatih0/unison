@@ -115,7 +115,9 @@ final class ControlModel: ObservableObject {
         let previousDefault = defaultID
         outputs = AudioControl.outputs(); defaultID = AudioControl.defaultOutput()
         observeNativeVolume()
-        if (softwareAudioRunning || audioStarting), systemVolume.deviceID != 0, defaultID != systemVolume.deviceID {
+        let awaitingRequestedRoute = systemVolume.isWaitingForRoute(defaultID)
+        if (softwareAudioRunning || audioStarting), systemVolume.deviceID != 0,
+           defaultID != systemVolume.deviceID, !awaitingRequestedRoute {
             stopSoftwareAudio()
             if let output = outputs.first(where: { $0.id == defaultID && !$0.isAggregate }) {
                 selected = [output.uid]; defaults.set(Array(selected), forKey: "selectedOutputs")
@@ -143,6 +145,7 @@ final class ControlModel: ObservableObject {
             syncNativeVolume(value: value, muted: AudioControl.muted(AudioControl.defaultOutput()))
         }
         ticks += 1
+        writeAudioStatus()
         if ticks % 8 == 0 { Task { await refreshDisplays() } }
     }
 
@@ -485,6 +488,12 @@ final class ControlModel: ObservableObject {
         try? text.write(toFile: CommandLine.arguments[index + 1], atomically: true, encoding: .utf8)
     }
 
+    private func writeAudioStatus() {
+        guard let index = CommandLine.arguments.firstIndex(of: "--audio-status"), CommandLine.arguments.count > index + 1 else { return }
+        let text = "starting=\(audioStarting)\nrunning=\(softwareAudioRunning)\nmaster=\(master)\nmuted=\(masterMuted)\nselected=\(selected.sorted())\nrendered=\(softwareAudio.outputUIDs)\ndevice_gains=\(deviceGains)\ndevice_mutes=\(deviceMuted)\ncontroller=\(systemVolume.uid)\namplitude=\(systemVolume.amplitude)\ncallbacks=\(softwareAudio.callbacks)\ninput_signals=\(softwareAudio.signalBlocks)\ninput_layout=\(softwareAudio.inputLayout)\noutput_layout=\(softwareAudio.outputLayout)\ndelivered=\(softwareAudio.deliveredBlocks)\nmessage=\(message)\n"
+        try? text.write(toFile: CommandLine.arguments[index + 1], atomically: true, encoding: .utf8)
+    }
+
     func enableKeys(prompt: Bool = true) {
         guard !keysEnabled else { return }
         // The event tap is the actual capability check. Do not block it using
@@ -803,6 +812,38 @@ final class ControlModel: ObservableObject {
             try? await Task.sleep(for: .milliseconds(250))
             guard softwareAudio.deliveredBlocks == muteBefore else { throw ControlError.message("Ortak sessize alma başarısız.") }
             report.append("master_mute=PASS")
+            if let speaker, let hdmi = physical.first(where: { $0.volume == nil }) {
+                masterMuted = false
+                deviceGains[speaker.uid] = 1
+                applyMaster()
+                for pass in 1...2 {
+                    toggleOutput(speaker, enabled: false)
+                    let readyDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+                    while (!softwareAudioRunning || softwareAudio.deliveredBlocks.first ?? 0 == 0), ContinuousClock.now < readyDeadline {
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
+                    guard softwareAudioRunning, selected == [hdmi.uid],
+                          softwareAudio.outputUIDs == [hdmi.uid], softwareAudio.deliveredBlocks.first ?? 0 > 0 else {
+                        throw ControlError.message("Çoklu çıkıştan tek HDMI geçişi başarısız: tur=\(pass), seçim=\(selected), render=\(softwareAudio.outputUIDs), callback=\(softwareAudio.callbacks), giriş=\(softwareAudio.signalBlocks), çıkış=\(softwareAudio.deliveredBlocks), durum=\(message).")
+                    }
+                    let deliveredBefore = softwareAudio.deliveredBlocks[0]
+                    try await Task.sleep(for: .milliseconds(250))
+                    guard softwareAudio.deliveredBlocks[0] > deliveredBefore else {
+                        throw ControlError.message("Tek HDMI akışı geçişten sonra durdu.")
+                    }
+                    report.append("multi_to_single_hdmi_\(pass)=PASS")
+                    toggleOutput(speaker, enabled: true)
+                    let multiDeadline = ContinuousClock.now.advanced(by: .seconds(5))
+                    while (!softwareAudioRunning || softwareAudio.deliveredBlocks.contains(0)), ContinuousClock.now < multiDeadline {
+                        try await Task.sleep(for: .milliseconds(20))
+                    }
+                    guard softwareAudioRunning, softwareAudio.deliveredBlocks.count == 2,
+                          softwareAudio.deliveredBlocks.allSatisfy({ $0 > 0 }) else {
+                        throw ControlError.message("Tek HDMI çıkışından çoklu çıkışa dönüş başarısız.")
+                    }
+                    report.append("single_hdmi_to_multi_\(pass)=PASS")
+                }
+            }
             // Complete forwarding checks before exercising Bluetooth route
             // changes; a user route change intentionally stops forwarding.
             if let speaker {

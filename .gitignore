@@ -1,0 +1,15 @@
+# Local build products and diagnostics
+.build/
+/build
+/build.noindex
+*.noindex/
+.swiftpm/
+.DS_Store
+Vendor/m1ddc/.objects/
+Vendor/m1ddc/m1ddc
+# Signing credentials never belong in source control
+*.p12
+*.p8
+*.mobileprovision
+.env
+.env.*

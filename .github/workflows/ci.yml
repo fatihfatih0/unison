@@ -1,0 +1,19 @@
+name: Build and test
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit, DSP, DDC and driver tests
+        run: ./Scripts/test.sh
+      - name: Build app and installer without credentials
+        env:
+          UNISON_SIGN_IDENTITY: "-"
+        run: ./Scripts/build-installer.sh

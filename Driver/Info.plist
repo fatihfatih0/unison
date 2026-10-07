@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>UnisonAudio</string>
+<key>CFBundleIdentifier</key><string>org.unison.audio.driver</string>
+<key>CFBundleName</key><string>UnisonAudio</string>
+<key>CFBundlePackageType</key><string>BNDL</string>
+<key>CFBundleVersion</key><string>1.0.0</string>
+<key>CFBundleShortVersionString</key><string>1.0.0</string>
+<key>CFPlugInFactories</key><dict><key>E5288C77-C525-4B7C-900D-E006144B5701</key><string>UnisonAudioFactory</string></dict>
+<key>CFPlugInTypes</key><dict><key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key><array><string>E5288C77-C525-4B7C-900D-E006144B5701</string></array></dict>
+<key>sandboxSafe</key><true/>
+<key>AudioServerPlugIn_MachServices</key><array/>
+</dict></plist>

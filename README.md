@@ -20,7 +20,7 @@ Unison is a free, open-source macOS menu bar app for HDMI volume control, extern
 
 **Apple Silicon · macOS 14.4+ · Preview**
 
-Download `Unison-Audio.pkg` from this repository’s Releases page when available. Open it, approve installation, then allow Accessibility and system audio capture when requested. The installer briefly restarts audio.
+Download `Unison-Audio.pkg` from [Releases](https://github.com/fatihfatih0/unison/releases) when available. Open it, approve installation, then allow Accessibility and system audio capture when requested. The installer briefly restarts audio.
 
 No release package yet? Download or clone the source, install Xcode 26 or newer and select its developer tools, then run:
 

@@ -32,7 +32,17 @@ final class DisplayGamma {
 
         func matches(_ other: Table) -> Bool {
             guard red.count == other.red.count, green.count == other.green.count, blue.count == other.blue.count else { return false }
-            return zip(red + green + blue, other.red + other.green + other.blue).allSatisfy { abs($0 - $1) < 0.002 }
+            return Self.channelMatches(red, other.red)
+                && Self.channelMatches(green, other.green)
+                && Self.channelMatches(blue, other.blue)
+        }
+
+        private static func channelMatches(_ values: [Float], _ other: [Float]) -> Bool {
+            for index in values.indices {
+                let difference: Float = values[index] - other[index]
+                guard abs(difference) < 0.002 else { return false }
+            }
+            return true
         }
     }
 

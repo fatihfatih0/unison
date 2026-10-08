@@ -7,6 +7,7 @@
 - Sliders support keyboard arrows, visible focus and reduced-motion preferences.
 - Native output and shared volume sliders update together immediately; system volume notifications replace waiting for the device polling cycle.
 - Pending macOS output routing gets a bounded grace period; regression checks exercise repeated multi-output / HDMI-only transitions.
+- Bluetooth headsets temporarily suspend the configured outputs; disconnecting restores the previous software/native group and its shared volume, including after an app restart.
 - HDMI and simultaneous audio through a local Core Audio Process Tap.
 - Aggregate stream readiness uses cancellable asynchronous polling; stopping/restarting retires pending startup safely.
 - DSP tests cover all 16 outputs, independent gains/mute and silent unconfigured channels.

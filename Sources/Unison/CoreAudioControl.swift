@@ -8,6 +8,11 @@ struct Output: Identifiable {
     let volume: Double?
     let muted: Bool?
     let isAggregate: Bool
+    var transportType: UInt32 = 0
+
+    var isBluetooth: Bool {
+        transportType == kAudioDeviceTransportTypeBluetooth || transportType == kAudioDeviceTransportTypeBluetoothLE
+    }
 }
 
 enum AudioControl {
@@ -18,6 +23,12 @@ enum AudioControl {
         var property = address(kAudioHardwarePropertyDefaultOutputDevice)
         return AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &property, .main) { _, _ in
             _ = defaultOutput()
+        }
+    }()
+    private static let deviceListObservation: OSStatus = {
+        var property = address(kAudioHardwarePropertyDevices)
+        return AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &property, .main) { _, _ in
+            _ = outputs()
         }
     }()
     static func address(_ selector: AudioObjectPropertySelector, scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal, element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain) -> AudioObjectPropertyAddress { AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element) }
@@ -110,18 +121,21 @@ enum AudioControl {
         if supportsMute { try setMute(id, muted: muted) }
     }
     static func outputs(includeController: Bool = false) -> [Output] {
+        _ = deviceListObservation
         var a = address(kAudioHardwarePropertyDevices), size: UInt32 = 0
         guard AudioObjectGetPropertyDataSize(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &size) == noErr else { return [] }
         var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
         guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &a, 0, nil, &size, &ids) == noErr else { return [] }
         return ids.compactMap { id in
+            var aliveAddress = address(kAudioDevicePropertyDeviceIsAlive), alive: UInt32 = 1, aliveSize: UInt32 = 4
+            if AudioObjectGetPropertyData(id, &aliveAddress, 0, nil, &aliveSize, &alive) == noErr, alive == 0 { return nil }
             var streams = address(kAudioDevicePropertyStreams, scope: kAudioObjectPropertyScopeOutput), streamSize: UInt32 = 0
             guard AudioObjectGetPropertyDataSize(id, &streams, 0, nil, &streamSize) == noErr, streamSize > 0 else { return nil }
             var transport = address(kAudioDevicePropertyTransportType), kind: UInt32 = 0, kindSize: UInt32 = 4
             _ = AudioObjectGetPropertyData(id, &transport, 0, nil, &kindSize, &kind)
             let uid = string(id, kAudioDevicePropertyDeviceUID)
             guard includeController || uid != "org.unison.output" else { return nil }
-            return Output(id: id, uid: uid, name: string(id, kAudioObjectPropertyName), volume: volume(id), muted: muted(id), isAggregate: kind == kAudioDeviceTransportTypeAggregate)
+            return Output(id: id, uid: uid, name: string(id, kAudioObjectPropertyName), volume: volume(id), muted: muted(id), isAggregate: kind == kAudioDeviceTransportTypeAggregate, transportType: kind)
         }
     }
     static func aggregate(_ outputs: [Output]) throws -> AudioDeviceID {

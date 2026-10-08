@@ -35,6 +35,7 @@ final class ControlModel: ObservableObject {
     private var displaySelectionInitialized = false
     private var aggregateID: AudioDeviceID?
     private var originalUID: String?
+    private var bluetoothRecovery = BluetoothRouteRecovery()
     private let defaults = UserDefaults.standard
     private var mediaKeys: MediaKeys?
     private var termination: NSObjectProtocol?
@@ -54,6 +55,10 @@ final class ControlModel: ObservableObject {
 
     init() {
         selected = Set(defaults.stringArray(forKey: "selectedOutputs") ?? [])
+        if let data = defaults.data(forKey: "bluetoothAudioRoute"),
+           let route = try? JSONDecoder().decode(BluetoothAudioRoute.self, from: data) {
+            bluetoothRecovery = BluetoothRouteRecovery(pending: route)
+        }
         if let saved = defaults.stringArray(forKey: "selectedDisplays") { selectedDisplays = Set(saved); displaySelectionInitialized = true }
         linkedMonitors = Set(defaults.stringArray(forKey: "linkedMonitors") ?? [])
         calibrations = defaults.dictionary(forKey: "calibrations") as? [String: Double] ?? [:]
@@ -63,6 +68,12 @@ final class ControlModel: ObservableObject {
         recoverRouting()
         observeNativeVolume()
         let savedTargets = outputs.filter { selected.contains($0.uid) && !$0.isAggregate }
+        if let current = outputs.first(where: { $0.id == defaultID && $0.isBluetooth }),
+           selected.count > 1 || (savedTargets.count == 1 && savedTargets[0].volume == nil) {
+            bluetoothRecovery.remember(BluetoothAudioRoute(bluetoothUID: current.uid, outputUIDs: selected,
+                                                         mode: .software, volume: master, muted: masterMuted))
+            persistBluetoothRecovery()
+        }
         if selected.count <= 1, savedTargets.allSatisfy({ $0.volume != nil }),
            let current = outputs.first(where: { $0.id == defaultID && !$0.isAggregate }) {
             selected = [current.uid]
@@ -70,7 +81,7 @@ final class ControlModel: ObservableObject {
             if let value = AudioControl.volume(current.id) { master = value; masterMuted = AudioControl.muted(current.id) ?? false }
         }
         termination = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.stopSoftwareAudio(); _ = self?.stopGroup(); self?.shade.reset() }
+            MainActor.assumeIsolated { self?.stopSoftwareAudio(clearBluetoothRecovery: false); _ = self?.stopGroup(clearBluetoothRecovery: false); self?.shade.reset() }
         }
         signal(SIGTERM, SIG_IGN)
         let signalSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -91,7 +102,8 @@ final class ControlModel: ObservableObject {
             if !CommandLine.arguments.contains("--render-preview"), !CommandLine.arguments.contains("--audio-smoke") {
                 enableKeys(prompt: CommandLine.arguments.contains("--request-key-permission") || !defaults.bool(forKey: "keysPermissionPrompted"))
                 let targets = outputs.filter { selected.contains($0.uid) && !$0.isAggregate }
-                if targets.count > 1 || (targets.first?.volume == nil && !targets.isEmpty) { startSoftwareAudio() }
+                if bluetoothRecovery.pending != nil { _ = resumeBluetoothRoute() }
+                else if targets.count > 1 || (targets.first?.volume == nil && !targets.isEmpty) { startSoftwareAudio() }
             }
         }
     }
@@ -113,32 +125,46 @@ final class ControlModel: ObservableObject {
         if !keysEnabled { enableKeys(prompt: false) }
         writeKeyStatus()
         let previousDefault = defaultID
+        let previousOutput = outputs.first(where: { $0.id == previousDefault })
         outputs = AudioControl.outputs(); defaultID = AudioControl.defaultOutput()
         observeNativeVolume()
         let awaitingRequestedRoute = systemVolume.isWaitingForRoute(defaultID)
-        if (softwareAudioRunning || audioStarting), systemVolume.deviceID != 0,
-           defaultID != systemVolume.deviceID, !awaitingRequestedRoute {
-            stopSoftwareAudio()
+        if !awaitingRequestedRoute, let headset = outputs.first(where: { $0.id == defaultID && $0.isBluetooth }) {
+            rememberBluetoothRoute(headset, previousOutput: previousOutput)
+        }
+        let usingTemporaryHeadset = bluetoothRecovery.pending != nil
+            && outputs.contains(where: { $0.id == defaultID && $0.isBluetooth && !selected.contains($0.uid) })
+        if (softwareAudioRunning || audioStarting),
+           usingTemporaryHeadset || (systemVolume.deviceID != 0 && defaultID != systemVolume.deviceID && !awaitingRequestedRoute) {
+            stopSoftwareAudio(clearBluetoothRecovery: false)
             if let output = outputs.first(where: { $0.id == defaultID && !$0.isAggregate }) {
                 selected = [output.uid]; defaults.set(Array(selected), forKey: "selectedOutputs")
             }
             message = "Sistem ses çıkışı değiştirildi; normal yönlendirmeye dönüldü."
         }
         if (softwareAudioRunning || audioStarting) && softwareAudio.outputUIDs.contains(where: { uid in !outputs.contains(where: { $0.uid == uid }) }) {
-            stopSoftwareAudio(); message = "Ses çıkışı ayrıldı; normal ses yönlendirmesine dönüldü."
+            stopSoftwareAudio(clearBluetoothRecovery: false); message = "Ses çıkışı ayrıldı; normal ses yönlendirmesine dönüldü."
         }
         if let id = aggregateID {
             let missing = selected.contains { uid in !outputs.contains { $0.uid == uid } }
             if missing || defaultID != id {
-                stopGroup()
+                stopGroup(clearBluetoothRecovery: false)
                 message = missing ? "Bir çıkış ayrıldı. Çoklu çıkış durduruldu ve kullanılabilir çıkışa dönüldü." : "Sistem çıkışı değiştirildi. Unison grubu kapatıldı."
             }
+        }
+        if !softwareAudioRunning, !audioStarting, !groupRunning {
+            if bluetoothRecovery.pending != nil,
+               let headset = outputs.first(where: { $0.id == defaultID && $0.isBluetooth }) {
+                selected = [headset.uid]
+                defaults.set(Array(selected), forKey: "selectedOutputs")
+            }
+            if resumeBluetoothRoute() { writeAudioStatus(); return }
         }
         if !softwareAudioRunning, !audioStarting, !groupRunning, selected.count <= 1,
            defaultID != previousDefault, let output = outputs.first(where: { $0.id == defaultID && !$0.isAggregate }) {
             selected = [output.uid]
             defaults.set(Array(selected), forKey: "selectedOutputs")
-            if output.volume == nil { startSoftwareAudio() }
+            if output.volume == nil, bluetoothRecovery.pending == nil { startSoftwareAudio() }
         }
         if !softwareAudioRunning, !audioStarting, usesNativeVolumeKeys,
            let value = AudioControl.volume(AudioControl.defaultOutput()) {
@@ -147,6 +173,57 @@ final class ControlModel: ObservableObject {
         ticks += 1
         writeAudioStatus()
         if ticks % 8 == 0 { Task { await refreshDisplays() } }
+    }
+
+    private func persistBluetoothRecovery() {
+        if let route = bluetoothRecovery.pending, let data = try? JSONEncoder().encode(route) {
+            defaults.set(data, forKey: "bluetoothAudioRoute")
+        } else { defaults.removeObject(forKey: "bluetoothAudioRoute") }
+    }
+
+    private func cancelBluetoothRecovery() {
+        guard bluetoothRecovery.pending != nil else { return }
+        bluetoothRecovery.cancel()
+        persistBluetoothRecovery()
+    }
+
+    private func rememberBluetoothRoute(_ headset: Output, previousOutput: Output? = nil) {
+        guard headset.isBluetooth else { return }
+        if softwareAudioRunning || audioStarting || groupRunning {
+            bluetoothRecovery.remember(BluetoothAudioRoute(bluetoothUID: headset.uid, outputUIDs: selected,
+                                                         mode: groupRunning ? .group : .software,
+                                                         volume: master, muted: masterMuted))
+        } else if let current = previousOutput ?? outputs.first(where: { $0.id == defaultID }), current.isAggregate {
+            bluetoothRecovery.remember(BluetoothAudioRoute(bluetoothUID: headset.uid,
+                                                         outputUIDs: AudioControl.subdeviceUIDs(current.id),
+                                                         mode: .device, volume: master, muted: masterMuted,
+                                                         deviceUID: current.uid))
+        }
+        persistBluetoothRecovery()
+    }
+
+    @discardableResult private func resumeBluetoothRoute() -> Bool {
+        guard bluetoothRecovery.pending != nil else { return false }
+        let previous = bluetoothRecovery.pending
+        let current = outputs.first(where: { $0.id == defaultID })
+            ?? AudioControl.outputs(includeController: true).first(where: { $0.id == defaultID })
+        let restored = bluetoothRecovery.update(current: current, outputs: outputs)
+        if previous != bluetoothRecovery.pending { persistBluetoothRecovery() }
+        guard let restored else { return false }
+        selected = restored.outputUIDs
+        master = restored.volume; masterMuted = restored.muted
+        defaults.set(Array(selected), forKey: "selectedOutputs")
+        defaults.set(master, forKey: "master")
+        switch restored.mode {
+        case .group: startGroup()
+        case .software: startSoftwareAudio()
+        case .device:
+            if let device = outputs.first(where: { $0.uid == restored.deviceUID }) {
+                do { try AudioControl.setDefault(device.id); pollAudio(); message = "Bluetooth bağlantısı kesildi; çoklu çıkışa dönüldü." }
+                catch { message = error.localizedDescription }
+            }
+        }
+        return true
     }
 
     private func builtInIDs() -> Set<String> {
@@ -192,6 +269,7 @@ final class ControlModel: ObservableObject {
 
     func toggleOutput(_ output: Output, enabled: Bool) {
         guard !output.isAggregate else { return }
+        cancelBluetoothRecovery()
         if softwareAudioRunning || audioStarting { stopSoftwareAudio() }
         if groupRunning && !stopGroup() { return }
         if enabled { selected.insert(output.uid) } else { selected.remove(output.uid) }
@@ -272,7 +350,7 @@ final class ControlModel: ObservableObject {
         guard let index = outputs.firstIndex(where: { $0.id == id }) else { return }
         let output = outputs[index]
         outputs[index] = Output(id: output.id, uid: output.uid, name: output.name,
-                                volume: value, muted: muted, isAggregate: output.isAggregate)
+                                volume: value, muted: muted, isAggregate: output.isAggregate, transportType: output.transportType)
     }
 
     private func observeNativeVolume() {
@@ -311,8 +389,9 @@ final class ControlModel: ObservableObject {
         }
     }
     func routeTo(_ output: Output) {
-        if softwareAudioRunning || audioStarting { stopSoftwareAudio() }
-        if groupRunning && !stopGroup() { return }
+        if output.isBluetooth { rememberBluetoothRoute(output) } else { cancelBluetoothRecovery() }
+        if softwareAudioRunning || audioStarting { stopSoftwareAudio(clearBluetoothRecovery: false) }
+        if groupRunning && !stopGroup(clearBluetoothRecovery: false) { cancelBluetoothRecovery(); return }
         if output.isAggregate {
             let uids = AudioControl.subdeviceUIDs(output.id)
             let members = outputs.filter { uids.contains($0.uid) && !$0.isAggregate }
@@ -382,6 +461,7 @@ final class ControlModel: ObservableObject {
     }
 
     func startGroup() {
+        cancelBluetoothRecovery()
         if softwareAudioRunning || audioStarting { stopSoftwareAudio() }
         guard aggregateID == nil else { return }
         let targets = outputs.filter { selected.contains($0.uid) && !$0.isAggregate }
@@ -400,7 +480,8 @@ final class ControlModel: ObservableObject {
         } catch { stopGroup(); message = error.localizedDescription }
     }
 
-    @discardableResult func stopGroup() -> Bool {
+    @discardableResult func stopGroup(clearBluetoothRecovery: Bool = true) -> Bool {
+        if clearBluetoothRecovery { cancelBluetoothRecovery() }
         guard let id = aggregateID else { return true }
         let current = AudioControl.defaultOutput()
         if current == id {
@@ -526,6 +607,7 @@ final class ControlModel: ObservableObject {
     }
 
     func startSoftwareAudio() {
+        cancelBluetoothRecovery()
         guard !audioStarting, !softwareAudioRunning else { return }
         if groupRunning && !stopGroup() { return }
         var targets = outputs.filter { selected.contains($0.uid) && !$0.isAggregate }
@@ -602,7 +684,8 @@ final class ControlModel: ObservableObject {
             }
         }
     }
-    func stopSoftwareAudio() {
+    func stopSoftwareAudio(clearBluetoothRecovery: Bool = true) {
+        if clearBluetoothRecovery { cancelBluetoothRecovery() }
         audioGeneration += 1
         audioTask?.cancel(); audioTask = nil
         audioStarting = false

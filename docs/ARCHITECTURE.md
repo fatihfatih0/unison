@@ -6,6 +6,7 @@ Unison is a Swift Package executable with an AppKit/SwiftUI menu bar interface a
 | --- | --- |
 | `Sources/Unison/UnisonApp.swift` | Panel, accessible sliders, hover and scoped mouse-wheel/trackpad scroll handling |
 | `ControlModel.swift` | Device state, selections, routing and lifecycle |
+| `BluetoothRouteRecovery.swift` | Remembered output group and automatic return after a temporary Bluetooth route |
 | `SoftwareAudio.swift` | Core Audio Process Tap and private multi-device aggregate |
 | `Sources/RealtimeAudio` | Stereo distribution and atomic per-device/master gain; no allocation or logging in the callback |
 | `CoreAudioControl.swift` | Devices, legacy/modern volume controls and native aggregates |
@@ -20,6 +21,8 @@ The audio engine starts without muting the source. It activates forwarding only 
 Aggregate stream readiness is polled asynchronously on the main actor with a 500 ms deadline. Each startup owns its tap, aggregate and DSP resources; cancellation or a newer session prevents a suspended startup from registering a callback or cleaning up the replacement session. Stopping the engine cancels pending readiness/activation work. Realtime output channels outside the configured device layout remain silent.
 
 The virtual driver exposes an output and a clock; it does not forward audio by itself. The app forwards captured audio to physical outputs. With the named endpoint, native speakers apply the shared level through their hardware volume controls and DSP passes their samples without a second gain. HDMI outputs apply the shared scalar level in DSP. The virtual endpoint's nominal dB curve is not used for physical attenuation. Normal exit restores physical levels, mute settings and the previous route. After a forced termination, reopening attempts recovery.
+
+Switching from a configured software/native group to a separate Bluetooth output saves that group's device UIDs, mode and shared volume/mute before stopping it. An existing macOS multi-output device is remembered by UID and selected again directly. The pending return survives app restarts. Once the headset disconnects and all saved outputs are available, the app resumes the group. Default-output notifications may precede removal from the device list, so a three-second grace period distinguishes that ordering from an intentional switch while the headset remains connected. Explicit selection/start/stop actions cancel the pending return. Devices reported as no longer alive are excluded from available outputs.
 
 Audio is processed in local memory, without recording or uploading. Preferences store device IDs and levels. There is no telemetry. DDC and built-in brightness use private Apple interfaces, so OS changes may affect support.
 

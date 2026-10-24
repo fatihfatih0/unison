@@ -25,6 +25,8 @@ Quit the normal Unison instance first. This integration test requires two physic
 
 The current smoke fixture was designed around a MacBook and HDMI monitor. It is opt-in and not run on CI. Hardware buffering checks do not prove matched acoustic latency or DDC backlight behavior.
 
+The selection smoke run also simulates a departed Bluetooth headset without changing Bluetooth settings, including repeated early system fallbacks and a missing model default, then checks that automatic recovery starts the real Mac speaker and display outputs and delivers audio to both. A physical headset power-off remains a separate manual check. For AirPods, check with the panel closed: start speaker/display audio, switch to AirPods, put both earbuds in the case and close it, then wait for disconnection. Audio should return without opening the panel. Repeat with only the native speaker available. Optional `--audio-status <path>` diagnostics include the current/default UIDs and pending Bluetooth return.
+
 ## Updating bundled dependencies
 
 The vendored libASPL contains the runtime headers, generated C++ sources and licenses needed by `build-driver.sh`. Upstream examples, generator tooling, documentation and Git metadata are omitted. For an upstream upgrade, use a separate checkout, preserve license notices, replace the runtime snapshot and update the revision in `THIRD_PARTY_NOTICES.md`. m1ddc contains local DDC packet validation changes; preserve them when upgrading.

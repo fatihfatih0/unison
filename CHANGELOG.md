@@ -7,7 +7,10 @@
 - Sliders support keyboard arrows, visible focus and reduced-motion preferences.
 - Native output and shared volume sliders update together immediately; system volume notifications replace waiting for the device polling cycle.
 - Pending macOS output routing gets a bounded grace period; regression checks exercise repeated multi-output / HDMI-only transitions.
-- Bluetooth headsets temporarily suspend the configured outputs; disconnecting restores the previous software/native group and its shared volume, including after an app restart.
+- Bluetooth headsets temporarily suspend the configured outputs and preserve pending route recovery across app restarts.
+- Delayed AirPods case disconnects no longer expire pending recovery after three seconds. Device availability changes trigger recovery even with a stale or missing system default; a native fallback is selected before group startup.
+- Bluetooth disconnects return managed audio to the Mac speaker together with currently available HDMI/DisplayPort audio, preserving the group's mode and shared volume. Without a previous group or display audio, the native Mac speaker remains active; explicitly remembered macOS multi-output devices are restored directly.
+- F10/F11/F12 follow the active Bluetooth output immediately, even when a stopped multi-output group remains saved; device refreshes and route notifications keep the selection and native controls synchronized.
 - HDMI and simultaneous audio through a local Core Audio Process Tap.
 - Aggregate stream readiness uses cancellable asynchronous polling; stopping/restarting retires pending startup safely.
 - DSP tests cover all 16 outputs, independent gains/mute and silent unconfigured channels.

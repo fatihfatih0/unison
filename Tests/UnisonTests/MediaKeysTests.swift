@@ -1,3 +1,4 @@
+import AppKit
 import XCTest
 @testable import Unison
 
@@ -39,6 +40,41 @@ final class MediaKeysTests: XCTestCase {
             XCTAssertFalse(state.consume(up, allowed: false, handler: handle))
             XCTAssertEqual(handled, 0)
         }
+    }
+
+    func testFunctionKeysForwardNativeMediaPressRepeatAndRelease() throws {
+        for (code, action) in [(111, 0), (103, 1), (109, 7)] {
+            var forwarding = NativeFunctionKeyForwarding()
+            let source = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: CGKeyCode(code), keyDown: true))
+            let down = try XCTUnwrap(VolumeKeyEvent.function(code: code, isDown: true))
+            let up = try XCTUnwrap(VolumeKeyEvent.function(code: code, isDown: false))
+            for (key, allowed, expectedData) in [(down, true, (action << 16) | 0x0a00),
+                                                (down, false, (action << 16) | 0x0a01),
+                                                (up, false, (action << 16) | 0x0b00)] {
+                let event = try XCTUnwrap(forwarding.event(for: key, source: source, allowed: allowed))
+                let native = try XCTUnwrap(NSEvent(cgEvent: event))
+                XCTAssertEqual(native.type, .systemDefined)
+                XCTAssertEqual(native.subtype.rawValue, 8)
+                XCTAssertEqual(native.data1, expectedData)
+                XCTAssertEqual(VolumeKeyEvent.media(subtype: 8, data: native.data1)?.action, action)
+            }
+            XCTAssertNil(forwarding.event(for: up, source: source, allowed: true))
+            XCTAssertNil(forwarding.event(for: down, source: source, allowed: false))
+        }
+    }
+
+    func testNativeMediaAndModifiedOrSoftwareFunctionKeysAreNotTranslated() throws {
+        var forwarding = NativeFunctionKeyForwarding()
+        let source = try XCTUnwrap(CGEvent(keyboardEventSource: nil, virtualKey: 103, keyDown: true))
+        let media = try XCTUnwrap(VolumeKeyEvent.media(subtype: 8, data: (1 << 16) | 0x0a00))
+        let function = try XCTUnwrap(VolumeKeyEvent.function(code: 103, isDown: true))
+        XCTAssertNil(forwarding.event(for: media, source: source, allowed: true))
+        XCTAssertNil(forwarding.event(for: function, source: source, allowed: false))
+        var consumption = VolumeKeyConsumption()
+        XCTAssertTrue(consumption.consume(function, allowed: true, handler: { _ in true }))
+        // A press that began in software keeps its owner if the native route
+        // becomes ready while held; it must not adjust volume twice.
+        XCTAssertNil(forwarding.event(for: function, source: source, allowed: !consumption.owns(function)))
     }
 
     func testMuteDoesNotToggleOnRepeatAndUnsupportedTargetPassesThrough() throws {

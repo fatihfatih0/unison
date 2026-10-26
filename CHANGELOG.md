@@ -11,6 +11,7 @@
 - Delayed AirPods case disconnects no longer expire pending recovery after three seconds. Device availability changes trigger recovery even with a stale or missing system default; a native fallback is selected before group startup.
 - Bluetooth disconnects return managed audio to the Mac speaker together with currently available HDMI/DisplayPort audio, preserving the group's mode and shared volume. Without a previous group or display audio, the native Mac speaker remains active; explicitly remembered macOS multi-output devices are restored directly.
 - F10/F11/F12 follow the active Bluetooth output immediately, even when a stopped multi-output group remains saved; device refreshes and route notifications keep the selection and native controls synchronized.
+- Saved, stopped output groups no longer swallow native volume keys or Apple's volume indicator. Function-key mode forwards F10/F11/F12 as native media keys when system volume is available; native-key checks avoid full device scans inside the event tap.
 - HDMI and simultaneous audio through a local Core Audio Process Tap.
 - Aggregate stream readiness uses cancellable asynchronous polling; stopping/restarting retires pending startup safely.
 - DSP tests cover all 16 outputs, independent gains/mute and silent unconfigured channels.

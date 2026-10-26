@@ -29,6 +29,8 @@ struct VolumeKeyEvent: Equatable {
 struct VolumeKeyConsumption {
     private var pressed: Set<Int> = []
 
+    func owns(_ key: VolumeKeyEvent) -> Bool { pressed.contains(key.identity) }
+
     mutating func consume(_ key: VolumeKeyEvent, allowed: Bool, handler: (Int) -> Bool) -> Bool {
         if !key.isDown { return pressed.remove(key.identity) != nil }
         if pressed.contains(key.identity) {
@@ -42,11 +44,34 @@ struct VolumeKeyConsumption {
     }
 }
 
+// Function-key mode emits ordinary F10/F11/F12 events, which macOS does not
+// treat as volume keys. Forward an equivalent media event through the same
+// native path, keeping each press/repeat/release together across route changes.
+struct NativeFunctionKeyForwarding {
+    private var pressed: Set<Int> = []
+
+    mutating func event(for key: VolumeKeyEvent, source: CGEvent, allowed: Bool) -> CGEvent? {
+        guard key.identity >= 1000 else { return nil }
+        let held = pressed.contains(key.identity)
+        guard held || (key.isDown && allowed) else { return nil }
+        let state = key.isDown ? 0x0a00 : 0x0b00
+        let repeated = key.isDown && held ? 1 : 0
+        guard let event = NSEvent.otherEvent(with: .systemDefined, location: .zero,
+                                            modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(source.flags.rawValue)),
+                                            timestamp: Double(source.timestamp) / 1_000_000_000,
+                                            windowNumber: 0, context: nil, subtype: 8,
+                                            data1: (key.action << 16) | state | repeated, data2: -1)?.cgEvent else { return nil }
+        if key.isDown { pressed.insert(key.identity) } else { pressed.remove(key.identity) }
+        return event
+    }
+}
+
 @MainActor
 final class MediaKeys {
     private var tap: CFMachPort?
     private var source: CFRunLoopSource?
     private var consumption = VolumeKeyConsumption()
+    private var functionForwarding = NativeFunctionKeyForwarding()
     let handler: (Int) -> Bool
     let nativeVolumeAvailable: () -> Bool
     init(nativeVolumeAvailable: @escaping () -> Bool = { false }, handler: @escaping (Int) -> Bool) {
@@ -55,12 +80,13 @@ final class MediaKeys {
     }
     func start() -> Bool {
         guard tap == nil else { return true }
-        let callback: CGEventTapCallBack = { _, type, event, context in
+        let callback: CGEventTapCallBack = { proxy, type, event, context in
             guard let context else { return Unmanaged.passUnretained(event) }
             return MainActor.assumeIsolated {
                 let owner = Unmanaged<MediaKeys>.fromOpaque(context).takeUnretainedValue()
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                     owner.consumption = VolumeKeyConsumption()
+                    owner.functionForwarding = NativeFunctionKeyForwarding()
                     if let tap = owner.tap { CGEvent.tapEnable(tap: tap, enable: true) }
                     return Unmanaged.passUnretained(event)
                 }
@@ -72,12 +98,18 @@ final class MediaKeys {
                 } else { key = nil }
                 guard let key else { return Unmanaged.passUnretained(event) }
                 let modifiers: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskShift]
+                let unmodified = event.flags.intersection(modifiers).isEmpty
+                let nativeVolume = owner.nativeVolumeAvailable()
+                if let forwarded = owner.functionForwarding.event(for: key, source: event,
+                                                                   allowed: unmodified && nativeVolume && !owner.consumption.owns(key)) {
+                    forwarded.tapPostEvent(proxy)
+                    return nil
+                }
                 // Pass real media keys through when our system-volume bridge is
                 // ready. macOS changes the volume and presents its own HUD;
                 // the property listener forwards that level to every output.
-                // Literal F10/F11/F12 remain mapped by Unison in function-key mode.
-                let delegateToSystem = key.identity < 1000 && owner.nativeVolumeAvailable()
-                let allowed = event.flags.intersection(modifiers).isEmpty && !delegateToSystem
+                let delegateToSystem = key.identity < 1000 && nativeVolume
+                let allowed = unmodified && !delegateToSystem
                 if owner.consumption.consume(key, allowed: allowed, handler: owner.handler) { return nil }
                 return Unmanaged.passUnretained(event)
             }

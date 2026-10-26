@@ -622,9 +622,9 @@ final class ControlModel: ObservableObject {
     }
 
     var usesNativeVolumeKeys: Bool {
-        let current = AudioControl.defaultOutput()
-        if softwareAudioRunning || audioStarting { return systemVolume.deviceID != 0 && systemVolume.deviceID == current }
-        return selected.count <= 1 && outputs.contains { $0.id == current && $0.volume != nil && (selected.isEmpty || selected.contains($0.uid)) }
+        AudioOutputSelection.usesNativeVolumeKeys(currentID: AudioControl.defaultOutput(), outputs: outputs,
+                                                 processingAudio: softwareAudioRunning || audioStarting,
+                                                 controllerID: systemVolume.deviceID)
     }
 
     private func syncNativeVolume(value: Double, muted: Bool?) {
@@ -672,9 +672,10 @@ final class ControlModel: ObservableObject {
         // The event tap is the actual capability check. Do not block it using
         // a separate permission preflight that can describe a different state.
         let keys = MediaKeys(nativeVolumeAvailable: { [weak self] in
-            guard let self else { return false }
-            pollAudio()
-            return usesNativeVolumeKeys
+            // HAL route listeners keep the model current. Enumerating all
+            // devices inside the event tap can exceed macOS's tap timeout and
+            // interrupt the native key/HUD path while a route is changing.
+            self?.usesNativeVolumeKeys ?? false
         }) { [weak self] key in self?.handleVolumeKey(key) ?? false }
         keysEnabled = keys.start()
         if keysEnabled {

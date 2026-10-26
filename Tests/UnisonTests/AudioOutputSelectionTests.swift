@@ -43,6 +43,31 @@ final class AudioOutputSelectionTests: XCTestCase {
         XCTAssertEqual(AudioOutputSelection.followingSystem(current: aggregate, selected: group, managedRouteActive: false), group)
     }
 
+    func testStoppedSavedGroupDoesNotSuppressNativeVolumeKeysOrHUD() {
+        let group: Set<String> = [speaker.uid, "hdmi"]
+        XCTAssertEqual(AudioOutputSelection.followingSystem(current: speaker, selected: group, managedRouteActive: false), group)
+        XCTAssertTrue(AudioOutputSelection.usesNativeVolumeKeys(currentID: speaker.id, outputs: [speaker],
+                                                               processingAudio: false, controllerID: 0))
+        XCTAssertTrue(AudioOutputSelection.usesNativeVolumeKeys(currentID: headset.id, outputs: [headset],
+                                                               processingAudio: false, controllerID: 0))
+    }
+
+    func testProcessingUsesNativeKeysOnlyAfterControllerOwnsCurrentRoute() {
+        for processing in [true, false] {
+            XCTAssertFalse(AudioOutputSelection.usesNativeVolumeKeys(currentID: 99, outputs: [speaker],
+                                                                    processingAudio: processing, controllerID: 0))
+        }
+        XCTAssertFalse(AudioOutputSelection.usesNativeVolumeKeys(currentID: speaker.id, outputs: [speaker],
+                                                                processingAudio: true, controllerID: 0))
+        XCTAssertFalse(AudioOutputSelection.usesNativeVolumeKeys(currentID: speaker.id, outputs: [speaker],
+                                                                processingAudio: true, controllerID: 99))
+        XCTAssertTrue(AudioOutputSelection.usesNativeVolumeKeys(currentID: 99, outputs: [speaker],
+                                                               processingAudio: true, controllerID: 99))
+        let hdmi = Output(id: 50, uid: "hdmi", name: "Display", volume: nil, muted: nil, isAggregate: false)
+        XCTAssertFalse(AudioOutputSelection.usesNativeVolumeKeys(currentID: hdmi.id, outputs: [speaker, hdmi],
+                                                                processingAudio: false, controllerID: 0))
+    }
+
     func testFollowingHeadsetDoesNotOverwriteRememberedGroupOrItsVolume() {
         let group: Set<String> = [speaker.uid, "hdmi"]
         let saved = BluetoothAudioRoute(bluetoothUID: headset.uid, outputUIDs: group, mode: .software, volume: 0.35, muted: true)

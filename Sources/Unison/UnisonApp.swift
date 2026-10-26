@@ -381,7 +381,7 @@ struct ControlPanel: View {
                 Label("Cihazları yenile", systemImage: "arrow.clockwise")
             }.disabled(model.busy)
             Divider()
-            Button("Unison'dan çık") { model.stopSoftwareAudio(); if model.stopGroup() { NSApp.terminate(nil) } }
+            Button("Unison'dan çık") { if model.prepareForTermination() { NSApp.terminate(nil) } }
         }.font(.system(size: 12)).foregroundStyle(Palette.text).buttonStyle(PanelButtonStyle())
             .padding(20).frame(width: 320).background(Palette.background).preferredColorScheme(.dark)
     }

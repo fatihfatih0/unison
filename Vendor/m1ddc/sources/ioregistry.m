@@ -5,6 +5,7 @@
 
 #include "ioregistry.h"
 #include "utils.h"
+#include <errno.h>
 
 static CFTypeRef getCFStringRef(io_service_t service, char* key) {
     CFStringRef cfstring = CFStringCreateWithCString(kCFAllocatorDefault, key, kCFStringEncodingASCII);
@@ -143,9 +144,11 @@ DisplayInfos* selectDisplay(DisplayInfos *displays, int connectedDisplays, char 
 
     // Checking if display identifier is a display index from the "list" command
     char *stop;
+    errno = 0;
     long displayNumber = strtol(displayIdentifier, &stop, 10);
     if (*stop == '\0') {
-        return displayNumber <= connectedDisplays ? displays + (displayNumber - 1) : NULL;
+        return stop != displayIdentifier && errno != ERANGE && displayNumber >= 1 && displayNumber <= connectedDisplays
+            ? displays + (displayNumber - 1) : NULL;
     }
 
     // Checking if an identification method is specified, otherwise defaulting to UUID

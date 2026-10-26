@@ -6,9 +6,12 @@ final class SystemVolumeBridge {
     private(set) var deviceID: AudioDeviceID = 0
     private(set) var uid = ""
     var amplitude: Double {
-        if uid == "org.unison.output" { return AudioControl.volume(deviceID) ?? lastVolume }
-        return AudioControl.linearAmplitude(deviceID) ?? lastVolume
+        if uid == "org.unison.output" { return audio.volume(deviceID) ?? lastVolume }
+        return audio.linearAmplitude(deviceID) ?? lastVolume
     }
+    private let audio: any AudioHardware
+    private let defaults: UserDefaults
+    private let observeChanges: Bool
     private var previousID: AudioDeviceID = 0
     private var requestedRoute = false
     private var routeTransition: AudioRouteTransition?
@@ -21,40 +24,45 @@ final class SystemVolumeBridge {
     private var lastMuted = false
     private var changed: ((Double, Bool) -> Void)?
 
+    init(audio: any AudioHardware = CoreAudioHardware(), defaults: UserDefaults = .standard, observeChanges: Bool = true) {
+        self.audio = audio; self.defaults = defaults; self.observeChanges = observeChanges
+    }
+
     func start(outputs: [Output], value: Double, muted: Bool, preferNamedOutput: Bool = false, renderedUIDs: Set<String> = [], changed: @escaping (Double, Bool) -> Void) throws {
         stop()
-        let current = AudioControl.defaultOutput()
-        let named = preferNamedOutput ? AudioControl.outputs(includeController: true).first(where: { $0.uid == "org.unison.output" && $0.volume != nil }) : nil
+        let current = audio.defaultOutput()
+        let named = preferNamedOutput ? audio.outputs(includeController: true).first(where: { $0.uid == "org.unison.output" && $0.volume != nil }) : nil
         guard let device = named ?? outputs.first(where: { $0.id == current && !$0.isAggregate && $0.volume != nil })
             ?? outputs.first(where: { !$0.isAggregate && $0.volume != nil && $0.name.localizedCaseInsensitiveContains("MacBook") }) else { return }
         previousID = current; deviceID = device.id; uid = device.uid
         do {
             if uid == "org.unison.output" {
-                UserDefaults.standard.set(AudioControl.string(current, kAudioDevicePropertyDeviceUID), forKey: "unisonNamedPreviousOutput")
+                defaults.set(audio.string(current, kAudioDevicePropertyDeviceUID), forKey: "unisonNamedPreviousOutput")
                 // Preserve physical controls and use the same hardware volume
                 // path as a standalone native speaker.
                 for output in outputs where output.volume != nil && renderedUIDs.contains(output.uid) {
-                    if let level = AudioControl.volume(output.id) { nativeLevels[output.uid] = level }
-                    if let mute = AudioControl.muted(output.id) { nativeMutes[output.uid] = mute }
+                    if let level = audio.volume(output.id) { nativeLevels[output.uid] = level }
+                    if let mute = audio.muted(output.id) { nativeMutes[output.uid] = mute }
                 }
                 // Save recovery information before changing any physical output.
-                UserDefaults.standard.set(nativeLevels, forKey: "unisonNormalizedVolumes")
-                UserDefaults.standard.set(nativeMutes, forKey: "unisonNormalizedMutes")
+                defaults.set(nativeLevels, forKey: "unisonNormalizedVolumes")
+                defaults.set(nativeMutes, forKey: "unisonNormalizedMutes")
                 for output in outputs where nativeLevels[output.uid] != nil {
                     let level = nativeLevels[output.uid] ?? 1
-                    try AudioControl.setLevel(output.id, value: level, muted: false)
+                    try audio.setLevel(output.id, value: level, muted: false)
                     writtenLevels[output.uid] = level; writtenMutes[output.uid] = false
-                    UserDefaults.standard.set(writtenLevels, forKey: "unisonWrittenNativeVolumes")
-                    UserDefaults.standard.set(writtenMutes, forKey: "unisonWrittenNativeMutes")
+                    defaults.set(writtenLevels, forKey: "unisonWrittenNativeVolumes")
+                    defaults.set(writtenMutes, forKey: "unisonWrittenNativeMutes")
                 }
             }
             requestedRoute = current != deviceID
             // Reassert the controller after creating the processing aggregate:
             // Bluetooth can complete an older route request during setup.
-            try AudioControl.setDefault(deviceID)
+            try audio.setDefault(deviceID)
             routeTransition = AudioRouteTransition(previous: current, target: deviceID)
             try write(value: value, muted: muted)
             self.changed = changed
+            guard observeChanges else { return }
             for selector in [kAudioDevicePropertyVolumeScalar, kAudioDevicePropertyMute] {
                 for (target, property) in AudioControl.controlTargets(deviceID, selector) {
                     var address = property
@@ -70,9 +78,9 @@ final class SystemVolumeBridge {
 
     func write(value: Double, muted: Bool) throws {
         guard deviceID != 0 else { return }
-        try AudioControl.setLevel(deviceID, value: value, muted: muted)
-        lastVolume = AudioControl.volume(deviceID) ?? value
-        lastMuted = AudioControl.muted(deviceID) ?? muted
+        try audio.setLevel(deviceID, value: value, muted: muted)
+        lastVolume = audio.volume(deviceID) ?? value
+        lastMuted = audio.muted(deviceID) ?? muted
     }
 
     func isWaitingForRoute(_ current: AudioDeviceID) -> Bool {
@@ -86,19 +94,19 @@ final class SystemVolumeBridge {
             let silent = muted || deviceMutes.contains(output.uid)
             let hardwareLevel = silent && output.muted == nil ? 0 : level
             guard writtenLevels[output.uid] != hardwareLevel || writtenMutes[output.uid] != silent else { continue }
-            try AudioControl.setLevel(output.id, value: level, muted: silent)
-            writtenLevels[output.uid] = AudioControl.volume(output.id) ?? hardwareLevel
-            writtenMutes[output.uid] = AudioControl.muted(output.id) ?? silent
-            UserDefaults.standard.set(writtenLevels, forKey: "unisonWrittenNativeVolumes")
-            UserDefaults.standard.set(writtenMutes, forKey: "unisonWrittenNativeMutes")
+            try audio.setLevel(output.id, value: level, muted: silent)
+            writtenLevels[output.uid] = audio.volume(output.id) ?? hardwareLevel
+            writtenMutes[output.uid] = audio.muted(output.id) ?? silent
+            defaults.set(writtenLevels, forKey: "unisonWrittenNativeVolumes")
+            defaults.set(writtenMutes, forKey: "unisonWrittenNativeMutes")
         }
     }
 
     func controlsNativeLevel(_ outputUID: String) -> Bool { nativeLevels[outputUID] != nil }
 
     private func readChange() {
-        guard deviceID != 0, let volume = AudioControl.volume(deviceID) else { return }
-        let muted = AudioControl.muted(deviceID) ?? false
+        guard deviceID != 0, let volume = audio.volume(deviceID) else { return }
+        let muted = audio.muted(deviceID) ?? false
         guard abs(volume - lastVolume) > 0.001 || muted != lastMuted else { return }
         lastVolume = volume; lastMuted = muted
         changed?(volume, muted)
@@ -111,34 +119,41 @@ final class SystemVolumeBridge {
             _ = AudioObjectRemovePropertyListenerBlock(target, &address, .main, listener)
         }
         listeners.removeAll()
-        let physical = AudioControl.outputs()
+        let physical = audio.outputs()
         for (savedUID, level) in nativeLevels {
-            if let written = writtenLevels[savedUID], let device = physical.first(where: { $0.uid == savedUID }), let current = AudioControl.volume(device.id), abs(current - written) < 0.001 {
-                try? AudioControl.setVolume(device.id, value: level)
+            if let written = writtenLevels[savedUID], let device = physical.first(where: { $0.uid == savedUID }), let current = audio.volume(device.id), abs(current - written) < 0.001 {
+                try? audio.setVolume(device.id, value: level)
             }
         }
         for (savedUID, muted) in nativeMutes {
-            if let written = writtenMutes[savedUID], let device = physical.first(where: { $0.uid == savedUID }), AudioControl.muted(device.id) == written, muted != written {
-                try? AudioControl.setMute(device.id, muted: muted)
+            if let written = writtenMutes[savedUID], let device = physical.first(where: { $0.uid == savedUID }), audio.muted(device.id) == written, muted != written {
+                try? audio.setMute(device.id, muted: muted)
             }
         }
         nativeLevels.removeAll()
         nativeMutes.removeAll()
         writtenLevels.removeAll(); writtenMutes.removeAll()
         if uid == "org.unison.output" {
-            UserDefaults.standard.removeObject(forKey: "unisonNormalizedVolumes")
-            UserDefaults.standard.removeObject(forKey: "unisonNormalizedMutes")
-            UserDefaults.standard.removeObject(forKey: "unisonWrittenNativeVolumes")
-            UserDefaults.standard.removeObject(forKey: "unisonWrittenNativeMutes")
+            defaults.removeObject(forKey: "unisonNormalizedVolumes")
+            defaults.removeObject(forKey: "unisonNormalizedMutes")
+            defaults.removeObject(forKey: "unisonWrittenNativeVolumes")
+            defaults.removeObject(forKey: "unisonWrittenNativeMutes")
         }
-        let current = AudioControl.defaultOutput()
+        let current = audio.defaultOutput()
         // Some routes switch asynchronously. Cancel our pending request even if
         // HAL still reports the previous device when the user stops the engine.
-        if requestedRoute, previousID != 0, (current == deviceID || current == previousID),
-           AudioControl.outputs().contains(where: { $0.id == previousID }) {
-            try? AudioControl.setDefault(previousID)
+        let ownsRoute = current == deviceID && deviceID != 0
+        if (requestedRoute && (ownsRoute || current == previousID)) || (uid == "org.unison.output" && ownsRoute) {
+            // The prior HDMI/USB device may have been unplugged while our
+            // virtual output remained selected. Always leave a usable route.
+            let available = physical.filter { $0.id != deviceID && !$0.uid.hasPrefix("org.unison.") }
+            if let fallback = available.first(where: { $0.id == previousID })
+                ?? available.first(where: { !$0.isAggregate && $0.isBuiltInSpeaker })
+                ?? available.first(where: { !$0.isAggregate }) {
+                try? audio.setDefault(fallback.id)
+            }
         }
-        if uid == "org.unison.output" { UserDefaults.standard.removeObject(forKey: "unisonNamedPreviousOutput") }
+        if uid == "org.unison.output" { defaults.removeObject(forKey: "unisonNamedPreviousOutput") }
         deviceID = 0; previousID = 0; requestedRoute = false; routeTransition = nil; uid = ""
     }
 }

@@ -21,7 +21,9 @@ struct BluetoothAudioRoute: Codable, Equatable {
 // managed group, select the built-in speaker and live display audio on return.
 struct BluetoothRouteRecovery {
     private(set) var pending: BluetoothAudioRoute?
+    private(set) var restoring = false
     private var fallbackUID: String?
+    private var retryAfter: ContinuousClock.Instant?
 
     init(pending: BluetoothAudioRoute? = nil) { self.pending = pending }
 
@@ -33,16 +35,29 @@ struct BluetoothRouteRecovery {
     }
 
     mutating func cancel() {
-        pending = nil; fallbackUID = nil
+        pending = nil; fallbackUID = nil; restoring = false; retryAfter = nil
     }
 
-    mutating func update(current: Output?, outputs: [Output]) -> BluetoothAudioRoute? {
+    // Keep the saved route until HAL and the forwarding engine accept it.
+    // A transient stream-readiness failure must not consume the return.
+    mutating func retry(currentUID: String?, now: ContinuousClock.Instant = .now) {
+        guard restoring else { return }
+        restoring = false
+        fallbackUID = currentUID
+        retryAfter = now.advanced(by: .seconds(1))
+    }
+
+    mutating func complete() { if restoring { cancel() } }
+
+    mutating func update(current: Output?, outputs: [Output], now: ContinuousClock.Instant = .now) -> BluetoothAudioRoute? {
         guard let route = pending else { return nil }
         if let current, current.isBluetooth, outputs.contains(where: { $0.uid == current.uid }) {
             pending?.bluetoothUID = current.uid
             fallbackUID = nil
+            restoring = false; retryAfter = nil
             return nil
         }
+        guard !restoring else { return nil }
 
         // AirPods may take well over three seconds to disappear after HAL
         // publishes a fallback. Keep the return armed until actual departure;
@@ -55,6 +70,7 @@ struct BluetoothRouteRecovery {
             if let fallbackUID, fallbackUID != current.uid { cancel(); return nil }
             fallbackUID = current.uid
         }
+        if let retryAfter, now < retryAfter { return nil }
 
         // HDMI can arrive or leave while Bluetooth is in use. Resolve automatic
         // groups from the live audio outputs rather than the entry-time snapshot.
@@ -62,15 +78,16 @@ struct BluetoothRouteRecovery {
                                                       volume: route.volume, muted: route.muted)
         if route.mode == .automatic || (route.mode != .device && (automatic?.outputUIDs.count ?? 0) > 1) {
             guard let automatic else { return nil }
-            cancel()
-            return BluetoothAudioRoute(bluetoothUID: route.bluetoothUID, outputUIDs: automatic.outputUIDs,
-                                       mode: route.mode, volume: route.volume, muted: route.muted)
+            let restored = BluetoothAudioRoute(bluetoothUID: route.bluetoothUID, outputUIDs: automatic.outputUIDs,
+                                               mode: route.mode, volume: route.volume, muted: route.muted)
+            pending = restored; restoring = true
+            return restored
         }
 
         let available = Set(outputs.filter { !$0.isAggregate }.map(\.uid))
         guard route.outputUIDs.isSubset(of: available) else { return nil }
         if route.mode == .device, !outputs.contains(where: { $0.uid == route.deviceUID }) { return nil }
-        cancel()
+        restoring = true
         return route
     }
 }

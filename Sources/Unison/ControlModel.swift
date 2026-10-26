@@ -25,18 +25,23 @@ final class ControlModel: ObservableObject {
     @Published var masterBrightness = 1.0
     @Published var deviceGains: [String: Double] = [:]
     @Published var deviceMuted: Set<String> = []
-    private let softwareAudio = SoftwareAudio()
-    private let systemVolume = SystemVolumeBridge()
-    private let ddc = DDC()
-    private let shade = ScreenShade()
+    private let softwareAudio: any SoftwareAudioEngine
+    private let systemVolume: SystemVolumeBridge
+    private let audio: any AudioHardware
+    private let systemIntegrationEnabled: Bool
+    private var shuttingDown = false
+    private var bluetoothNativeTransition: AudioRouteTransition?
+    private let ddc: any DisplayDDC
+    private let shade: any DisplayShading
     private var timer: Timer?
     private var brightnessTimer: Timer?
     private var ticks = 0
     private var displaySelectionInitialized = false
+    private var groupTransition: AudioRouteTransition?
     private var aggregateID: AudioDeviceID?
     private var originalUID: String?
     private var bluetoothRecovery = BluetoothRouteRecovery()
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
     private var mediaKeys: MediaKeys?
     private var termination: NSObjectProtocol?
     private var terminationSignal: DispatchSourceSignal?
@@ -56,7 +61,16 @@ final class ControlModel: ObservableObject {
         } catch { message = error.localizedDescription }
     }
 
-    init() {
+    init(defaults: UserDefaults = .standard, audio: any AudioHardware = CoreAudioHardware(),
+         softwareAudio: (any SoftwareAudioEngine)? = nil, ddc: any DisplayDDC = DDC(),
+         shade: (any DisplayShading)? = nil, startServices: Bool = true) {
+        self.defaults = defaults
+        self.audio = audio
+        self.softwareAudio = softwareAudio ?? SoftwareAudio()
+        self.systemVolume = SystemVolumeBridge(audio: audio, defaults: defaults, observeChanges: startServices)
+        self.ddc = ddc
+        self.shade = shade ?? ScreenShade()
+        systemIntegrationEnabled = startServices
         selected = Set(defaults.stringArray(forKey: "selectedOutputs") ?? [])
         if let data = defaults.data(forKey: "bluetoothAudioRoute"),
            let route = try? JSONDecoder().decode(BluetoothAudioRoute.self, from: data) {
@@ -66,7 +80,8 @@ final class ControlModel: ObservableObject {
         linkedMonitors = Set(defaults.stringArray(forKey: "linkedMonitors") ?? [])
         calibrations = defaults.dictionary(forKey: "calibrations") as? [String: Double] ?? [:]
         if defaults.object(forKey: "master") != nil { master = defaults.double(forKey: "master").clamped }
-        outputs = AudioControl.outputs(); defaultID = AudioControl.defaultOutput()
+        outputs = audio.outputs(); defaultID = audio.defaultOutput()
+        guard startServices else { return }
         if selected.isEmpty, let current = outputs.first(where: { $0.id == defaultID && !$0.isAggregate }) { selected.insert(current.uid) }
         recoverRouting()
         observeNativeVolume()
@@ -84,11 +99,11 @@ final class ControlModel: ObservableObject {
            let current = outputs.first(where: { $0.id == defaultID && !$0.isAggregate }) {
             selected = [current.uid]
             defaults.set(Array(selected), forKey: "selectedOutputs")
-            if let value = AudioControl.volume(current.id) { master = value; masterMuted = AudioControl.muted(current.id) ?? false }
+            if let value = audio.volume(current.id) { syncNativeVolume(value: value, muted: audio.muted(current.id)) }
         }
         observeAudioRouting()
         termination = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.stopSoftwareAudio(clearBluetoothRecovery: false); _ = self?.stopGroup(clearBluetoothRecovery: false); self?.shade.reset() }
+            MainActor.assumeIsolated { _ = self?.prepareForTermination() }
         }
         signal(SIGTERM, SIG_IGN)
         let signalSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
@@ -143,13 +158,13 @@ final class ControlModel: ObservableObject {
     func pollAudio() {
         // Start/stop and recovery can refresh again while handling a HAL
         // notification. Let the outer refresh finish the routing decision.
-        guard !refreshingAudioRoute else { return }
+        guard !refreshingAudioRoute, !shuttingDown else { return }
         refreshingAudioRoute = true
         defer { refreshingAudioRoute = false; writeAudioStatus() }
         let previousDefault = defaultID
         let previousOutput = outputs.first(where: { $0.id == previousDefault })
         observeAudioAvailability()
-        outputs = AudioControl.outputs(); defaultID = AudioControl.defaultOutput()
+        outputs = audio.outputs(); defaultID = audio.defaultOutput()
         observeNativeVolume()
         // Creating our processing devices also emits device-list changes.
         // The bridge must finish binding before comparing its intended route.
@@ -166,6 +181,10 @@ final class ControlModel: ObservableObject {
             && outputs.contains(where: { $0.id == defaultID && $0.isBluetooth && !selected.contains($0.uid) })
         if (softwareAudioRunning || audioStarting),
            usingTemporaryHeadset || (systemVolume.deviceID != 0 && defaultID != systemVolume.deviceID && !awaitingRequestedRoute) {
+            if bluetoothRecovery.restoring, !usingTemporaryHeadset,
+               let current = outputs.first(where: { $0.id == defaultID }), !selected.contains(current.uid) {
+                cancelBluetoothRecovery()
+            }
             stopSoftwareAudio(clearBluetoothRecovery: false)
             if let output = outputs.first(where: { $0.id == defaultID && !$0.isAggregate }) {
                 selected = [output.uid]; defaults.set(Array(selected), forKey: "selectedOutputs")
@@ -177,10 +196,19 @@ final class ControlModel: ObservableObject {
         }
         if let id = aggregateID {
             let missing = selected.contains { uid in !outputs.contains { $0.uid == uid } }
-            if missing || defaultID != id {
+            let awaitingGroup = groupTransition?.isPending(current: defaultID) ?? false
+            if missing || (defaultID != id && !awaitingGroup) {
+                if bluetoothRecovery.restoring, !missing,
+                   let current = outputs.first(where: { $0.id == defaultID }), !current.isBluetooth, !selected.contains(current.uid) {
+                    cancelBluetoothRecovery()
+                }
                 stopGroup(clearBluetoothRecovery: false)
                 message = missing ? "Bir çıkış ayrıldı. Çoklu çıkış durduruldu ve kullanılabilir çıkışa dönüldü." : "Sistem çıkışı değiştirildi. Unison grubu kapatıldı."
             }
+        }
+        if bluetoothRecovery.restoring {
+            if softwareAudioRunning, systemVolume.deviceID == 0 || defaultID == systemVolume.deviceID { completeBluetoothRecovery() }
+            if groupRunning, defaultID == aggregateID { completeBluetoothRecovery() }
         }
         if !softwareAudioRunning, !audioStarting, !groupRunning {
             if bluetoothRecovery.pending != nil,
@@ -199,8 +227,8 @@ final class ControlModel: ObservableObject {
             if current?.volume == nil, bluetoothRecovery.pending == nil { startSoftwareAudio() }
         }
         if !softwareAudioRunning, !audioStarting, usesNativeVolumeKeys,
-           let value = AudioControl.volume(AudioControl.defaultOutput()) {
-            syncNativeVolume(value: value, muted: AudioControl.muted(AudioControl.defaultOutput()))
+           let value = audio.volume(audio.defaultOutput()) {
+            syncNativeVolume(value: value, muted: audio.muted(audio.defaultOutput()))
         }
     }
 
@@ -211,6 +239,7 @@ final class ControlModel: ObservableObject {
     }
 
     private func cancelBluetoothRecovery() {
+        bluetoothNativeTransition = nil
         guard bluetoothRecovery.pending != nil else { return }
         bluetoothRecovery.cancel()
         persistBluetoothRecovery()
@@ -224,7 +253,7 @@ final class ControlModel: ObservableObject {
                                                          volume: master, muted: masterMuted))
         } else if let current = previousOutput ?? outputs.first(where: { $0.id == defaultID }), current.isAggregate {
             bluetoothRecovery.remember(BluetoothAudioRoute(bluetoothUID: headset.uid,
-                                                         outputUIDs: AudioControl.subdeviceUIDs(current.id),
+                                                         outputUIDs: audio.subdeviceUIDs(current.id),
                                                          mode: .device, volume: master, muted: masterMuted,
                                                          deviceUID: current.uid))
         }
@@ -237,11 +266,29 @@ final class ControlModel: ObservableObject {
         persistBluetoothRecovery()
     }
 
+    private func completeBluetoothRecovery() {
+        bluetoothRecovery.complete()
+        bluetoothNativeTransition = nil
+        persistBluetoothRecovery()
+    }
+
+    private func retryBluetoothRecovery() {
+        bluetoothRecovery.retry(currentUID: audio.outputs(includeController: true)
+            .first(where: { $0.id == audio.defaultOutput() })?.uid)
+        bluetoothNativeTransition = nil
+        persistBluetoothRecovery()
+    }
+
     @discardableResult private func resumeBluetoothRoute() -> Bool {
-        guard bluetoothRecovery.pending != nil else { return false }
+        guard bluetoothRecovery.pending != nil, !shuttingDown else { return false }
+        if var transition = bluetoothNativeTransition {
+            if defaultID == transition.target { completeBluetoothRecovery(); return true }
+            if transition.isPending(current: defaultID) { bluetoothNativeTransition = transition; return true }
+            retryBluetoothRecovery()
+        }
         let previous = bluetoothRecovery.pending
         let current = outputs.first(where: { $0.id == defaultID })
-            ?? AudioControl.outputs(includeController: true).first(where: { $0.id == defaultID })
+            ?? audio.outputs(includeController: true).first(where: { $0.id == defaultID })
         let restored = bluetoothRecovery.update(current: current, outputs: outputs)
         if previous != bluetoothRecovery.pending { persistBluetoothRecovery() }
         guard let restored else { return false }
@@ -249,33 +296,39 @@ final class ControlModel: ObservableObject {
         master = restored.volume; masterMuted = restored.muted
         defaults.set(Array(selected), forKey: "selectedOutputs")
         defaults.set(master, forKey: "master")
-        // Restore an audible native route before asynchronous group startup.
-        // The old default may still be the departed headset or our idle driver.
-        if restored.mode != .device,
-           let fallback = outputs.first(where: { selected.contains($0.uid) && $0.isBuiltInSpeaker })
-                ?? outputs.first(where: { selected.contains($0.uid) && !$0.isAggregate }) {
-            do { try AudioControl.setDefault(fallback.id) }
-            catch { message = error.localizedDescription }
-        }
-        switch restored.mode {
-        case .group: startGroup()
-        case .software: startSoftwareAudio()
-        case .automatic:
-            if selected.count > 1 { startSoftwareAudio() }
-            else if let speaker = outputs.first(where: { selected.contains($0.uid) }) {
-                do {
-                    try AudioControl.setDefault(speaker.id)
-                    if speaker.volume != nil { try AudioControl.setLevel(speaker.id, value: master, muted: masterMuted) }
-                    pollAudio()
+        do {
+            // Keep native audio available while the asynchronous engine starts.
+            if restored.mode != .device,
+               let fallback = outputs.first(where: { selected.contains($0.uid) && $0.isBuiltInSpeaker })
+                    ?? outputs.first(where: { selected.contains($0.uid) && !$0.isAggregate }) {
+                try audio.setDefault(fallback.id)
+            }
+            switch restored.mode {
+            case .group:
+                startGroup(clearBluetoothRecovery: false)
+                if !groupRunning { retryBluetoothRecovery() }
+            case .software:
+                startSoftwareAudio(clearBluetoothRecovery: false)
+            case .automatic:
+                if selected.count > 1 { startSoftwareAudio(clearBluetoothRecovery: false) }
+                else if let speaker = outputs.first(where: { selected.contains($0.uid) }) {
+                    let previous = audio.defaultOutput()
+                    try audio.setDefault(speaker.id)
+                    if speaker.volume != nil { try audio.setLevel(speaker.id, value: master, muted: masterMuted) }
+                    bluetoothNativeTransition = AudioRouteTransition(previous: previous, target: speaker.id)
+                    if audio.defaultOutput() == speaker.id { completeBluetoothRecovery() }
                     message = "Bluetooth bağlantısı kesildi; Mac hoparlörüne dönüldü."
-                } catch { message = error.localizedDescription }
+                }
+            case .device:
+                if let device = outputs.first(where: { $0.uid == restored.deviceUID }) {
+                    let previous = audio.defaultOutput()
+                    try audio.setDefault(device.id)
+                    bluetoothNativeTransition = AudioRouteTransition(previous: previous, target: device.id)
+                    if audio.defaultOutput() == device.id { completeBluetoothRecovery() }
+                    message = "Bluetooth bağlantısı kesildi; çoklu çıkışa dönüldü."
+                }
             }
-        case .device:
-            if let device = outputs.first(where: { $0.uid == restored.deviceUID }) {
-                do { try AudioControl.setDefault(device.id); pollAudio(); message = "Bluetooth bağlantısı kesildi; çoklu çıkışa dönüldü." }
-                catch { message = error.localizedDescription }
-            }
-        }
+        } catch { retryBluetoothRecovery(); message = error.localizedDescription }
         return true
     }
 
@@ -301,7 +354,7 @@ final class ControlModel: ObservableObject {
         defer { busy = false }
         do {
             var discovered = try await ddc.discover(builtInIDs: builtInIDs())
-            for screen in NSScreen.screens {
+            for screen in systemIntegrationEnabled ? NSScreen.screens : [] {
                 guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber, CGDisplayIsBuiltin(number.uint32Value) != 0, let uuid = CGDisplayCreateUUIDFromDisplayID(number.uint32Value)?.takeRetainedValue() else { continue }
                 discovered.append(Monitor(id: CFUUIDCreateString(nil, uuid) as String, name: "Yerleşik Retina ekran", brightness: NativeBrightness.read(number.uint32Value), builtIn: true, displayID: number.uint32Value))
             }
@@ -316,6 +369,11 @@ final class ControlModel: ObservableObject {
                 return result
             }
             shade.prune(available: Set(monitors.map(\.id)))
+            // The renderer removes disconnected surfaces. Reapply the retained
+            // user level when a software-controlled display is available again.
+            for monitor in monitors where !monitor.builtIn && monitor.brightness == nil && !monitor.manual {
+                if let brightness = softwareBrightness[monitor.id] { shade.set(monitor.id, brightness: brightness) }
+            }
             if !displaySelectionInitialized { selectedDisplays = Set(monitors.map(\.id)); displaySelectionInitialized = true }
         } catch { message = error.localizedDescription }
     }
@@ -332,7 +390,7 @@ final class ControlModel: ObservableObject {
             startSoftwareAudio()
         } else if let target = targets.first {
             routeTo(target)
-            if let volume = AudioControl.volume(target.id) { master = volume }
+            if let volume = audio.volume(target.id) { syncNativeVolume(value: volume, muted: audio.muted(target.id)) }
         }
     }
     func setManual(_ id: String, enabled: Bool) {
@@ -372,7 +430,7 @@ final class ControlModel: ObservableObject {
         }
         if output.volume != nil {
             do {
-                try AudioControl.setLevel(output.id, value: value, muted: value > 0 ? false : AudioControl.muted(output.id) ?? false)
+                try audio.setLevel(output.id, value: value, muted: value > 0 ? false : audio.muted(output.id) ?? false)
                 publishNativeLevel(output.id, value: value.clamped, muted: value > 0 ? false : output.muted)
                 if usesNativeVolumeKeys, output.id == defaultID {
                     syncNativeVolume(value: value.clamped, muted: value > 0 ? false : output.muted)
@@ -380,7 +438,7 @@ final class ControlModel: ObservableObject {
             } catch { message = error.localizedDescription }
             return
         }
-        do { try AudioControl.setVolume(output.id, value: value); pollAudio() } catch { message = error.localizedDescription }
+        do { try audio.setVolume(output.id, value: value); pollAudio() } catch { message = error.localizedDescription }
     }
     func outputMuted(_ output: Output) -> Bool? {
         if softwareAudioRunning || audioStarting, softwareAudio.outputUIDs.contains(output.uid) { return deviceMuted.contains(output.uid) }
@@ -392,9 +450,10 @@ final class ControlModel: ObservableObject {
             updateSoftwareGains()
             return
         }
-        do { try AudioControl.setMute(output.id, muted: !(output.muted ?? false)); pollAudio() } catch { message = error.localizedDescription }
+        do { try audio.setMute(output.id, muted: !(output.muted ?? false)); pollAudio() } catch { message = error.localizedDescription }
     }
     private func observeAudioRouting() {
+        guard systemIntegrationEnabled else { return }
         let system = AudioObjectID(kAudioObjectSystemObject)
         for selector in [kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices] {
             var property = AudioControl.address(selector)
@@ -409,6 +468,7 @@ final class ControlModel: ObservableObject {
     }
 
     private func observeAudioAvailability() {
+        guard systemIntegrationEnabled else { return }
         // Subscribe before reading availability. HAL can mark a Bluetooth
         // device dead without changing the device list or default yet. Ignore
         // processing aggregates, whose availability changes during start/stop.
@@ -441,6 +501,7 @@ final class ControlModel: ObservableObject {
     }
 
     private func observeNativeVolume() {
+        guard systemIntegrationEnabled else { return }
         guard defaultID != nativeVolumeDevice else { return }
         for (target, property, listener) in nativeVolumeListeners {
             var address = property
@@ -457,8 +518,8 @@ final class ControlModel: ObservableObject {
                     MainActor.assumeIsolated {
                         guard let self, self.nativeVolumeDevice == id,
                               !self.softwareAudioRunning, !self.audioStarting,
-                              let value = AudioControl.volume(id) else { return }
-                        let muted = AudioControl.muted(id)
+                              let value = self.audio.volume(id) else { return }
+                        let muted = self.audio.muted(id)
                         // Our slider writes already published this level. Do
                         // not reinterpret their hardware echo as a new master
                         // value (especially with per-device calibration).
@@ -480,7 +541,7 @@ final class ControlModel: ObservableObject {
         if softwareAudioRunning || audioStarting { stopSoftwareAudio(clearBluetoothRecovery: false) }
         if groupRunning && !stopGroup(clearBluetoothRecovery: false) { cancelBluetoothRecovery(); return }
         if output.isAggregate {
-            let uids = AudioControl.subdeviceUIDs(output.id)
+            let uids = audio.subdeviceUIDs(output.id)
             let members = outputs.filter { uids.contains($0.uid) && !$0.isAggregate }
             if !members.isEmpty {
                 selected = Set(members.map(\.uid))
@@ -492,7 +553,7 @@ final class ControlModel: ObservableObject {
             selected = [output.uid]
             defaults.set(Array(selected), forKey: "selectedOutputs")
         }
-        do { try AudioControl.setDefault(output.id); pollAudio(); message = "Ses çıkışı: \(output.name)" } catch { message = error.localizedDescription }
+        do { try audio.setDefault(output.id); pollAudio(); message = "Ses çıkışı: \(output.name)" } catch { message = error.localizedDescription }
     }
 
     func writeDisplay(_ id: String, feature: String, value: Double) {
@@ -521,6 +582,7 @@ final class ControlModel: ObservableObject {
     }
     func applyMaster() {
         defaults.set(master, forKey: "master")
+        defer { applyLinkedMonitorVolume() }
         if groupRunning, outputs.contains(where: { selected.contains($0.uid) && !$0.isAggregate && $0.volume == nil }) {
             startSoftwareAudio()
         }
@@ -534,51 +596,57 @@ final class ControlModel: ObservableObject {
             if output.volume != nil {
                 do {
                     let value = (master * (calibrations[output.uid] ?? 1)).clamped
-                    try AudioControl.setLevel(output.id, value: value, muted: masterMuted)
+                    try audio.setLevel(output.id, value: value, muted: masterMuted)
                     publishNativeLevel(output.id, value: value, muted: masterMuted)
                 } catch { message = error.localizedDescription }
             } else if !monitors.contains(where: { $0.name == output.name && linkedMonitors.contains($0.id) }) { unsupported.append(output.name) }
         }
-        let targets = monitors.filter { linkedMonitors.contains($0.id) && ($0.volume != nil || $0.manual) }
         if !unsupported.isEmpty { message = "Ortak ses ayarı desteklenmiyor: \(unsupported.joined(separator: ", ")). Monitörü DDC ortak ses grubuna bağlayın." }
+    }
+
+    private func applyLinkedMonitorVolume() {
+        let targets = monitors.filter { linkedMonitors.contains($0.id) && ($0.volume != nil || $0.manual) }
         let value = masterMuted ? 0 : master
         for target in targets {
             writeDisplay(target.id, feature: "volume", value: value * (calibrations["display.\(target.id)"] ?? 1))
         }
     }
 
-    func startGroup() {
-        cancelBluetoothRecovery()
-        if softwareAudioRunning || audioStarting { stopSoftwareAudio() }
+    func startGroup(clearBluetoothRecovery: Bool = true) {
+        guard !shuttingDown else { return }
+        if clearBluetoothRecovery { cancelBluetoothRecovery() }
+        if softwareAudioRunning || audioStarting { stopSoftwareAudio(clearBluetoothRecovery: clearBluetoothRecovery) }
         guard aggregateID == nil else { return }
         let targets = outputs.filter { selected.contains($0.uid) && !$0.isAggregate }
         guard targets.count == selected.count, targets.count >= 2 else { message = "En az iki bağlı fiziksel çıkış seçin."; return }
-        let previous = AudioControl.defaultOutput()
-        originalUID = AudioControl.string(previous, kAudioDevicePropertyDeviceUID)
+        let previous = audio.defaultOutput()
+        originalUID = audio.string(previous, kAudioDevicePropertyDeviceUID)
         do {
-            let id = try AudioControl.aggregate(targets)
+            let id = try audio.aggregate(targets)
             aggregateID = id
             defaults.set(originalUID, forKey: "previousOutput")
-            defaults.set(AudioControl.string(id, kAudioDevicePropertyDeviceUID), forKey: "ownedAggregate")
-            try AudioControl.setDefault(id)
+            defaults.set(audio.string(id, kAudioDevicePropertyDeviceUID), forKey: "ownedAggregate")
+            try audio.setDefault(id)
+            groupTransition = AudioRouteTransition(previous: previous, target: id)
             groupRunning = true
             pollAudio()
             message = "Çoklu çıkış açık. Bluetooth ile kablolu çıkışlar arasında gecikme olabilir."
-        } catch { stopGroup(); message = error.localizedDescription }
+        } catch { stopGroup(clearBluetoothRecovery: clearBluetoothRecovery); message = error.localizedDescription }
     }
 
     @discardableResult func stopGroup(clearBluetoothRecovery: Bool = true) -> Bool {
         if clearBluetoothRecovery { cancelBluetoothRecovery() }
         guard let id = aggregateID else { return true }
-        let current = AudioControl.defaultOutput()
-        if current == id {
-            let available = AudioControl.outputs().filter { $0.id != id }
+        let current = audio.defaultOutput()
+        if current == id || (groupTransition?.isPending(current: current) ?? false) {
+            let available = audio.outputs().filter { $0.id != id }
             guard let fallback = available.first(where: { $0.uid == originalUID }) ?? available.first(where: { !$0.isAggregate }) else { message = "Dönülecek ses çıkışı bulunamadı; grup korundu."; return false }
-            do { try AudioControl.setDefault(fallback.id) } catch { message = error.localizedDescription; return false }
+            do { try audio.setDefault(fallback.id) } catch { message = error.localizedDescription; return false }
         }
-        let status = AudioHardwareDestroyAggregateDevice(id)
+        let status = audio.destroyAggregate(id)
         guard status == noErr else { message = "Grup silinemedi: \(status)"; return false }
-        aggregateID = nil; groupRunning = false
+        aggregateID = nil; groupRunning = false; groupTransition = nil
+        if !clearBluetoothRecovery, !shuttingDown { retryBluetoothRecovery() }
         defaults.removeObject(forKey: "ownedAggregate"); defaults.removeObject(forKey: "previousOutput")
         pollAudio()
         return true
@@ -588,8 +656,8 @@ final class ControlModel: ObservableObject {
         if let levels = defaults.dictionary(forKey: "unisonNormalizedVolumes") as? [String: Double] {
             let written = defaults.dictionary(forKey: "unisonWrittenNativeVolumes") as? [String: Double] ?? [:]
             for (uid, level) in levels {
-                if let output = outputs.first(where: { $0.uid == uid }), let current = AudioControl.volume(output.id), abs(current - (written[uid] ?? 1)) < 0.001 {
-                    try? AudioControl.setVolume(output.id, value: level)
+                if let output = outputs.first(where: { $0.uid == uid }), let current = audio.volume(output.id), abs(current - (written[uid] ?? 1)) < 0.001 {
+                    try? audio.setVolume(output.id, value: level)
                 }
             }
             defaults.removeObject(forKey: "unisonNormalizedVolumes")
@@ -598,49 +666,60 @@ final class ControlModel: ObservableObject {
         if let mutes = defaults.dictionary(forKey: "unisonNormalizedMutes") as? [String: Bool] {
             let written = defaults.dictionary(forKey: "unisonWrittenNativeMutes") as? [String: Bool] ?? [:]
             for (uid, muted) in mutes {
-                if let output = outputs.first(where: { $0.uid == uid }), AudioControl.muted(output.id) == (written[uid] ?? false) {
-                    try? AudioControl.setMute(output.id, muted: muted)
+                if let output = outputs.first(where: { $0.uid == uid }), audio.muted(output.id) == (written[uid] ?? false) {
+                    try? audio.setMute(output.id, muted: muted)
                 }
             }
             defaults.removeObject(forKey: "unisonNormalizedMutes")
             defaults.removeObject(forKey: "unisonWrittenNativeMutes")
         }
-        if AudioControl.string(defaultID, kAudioDevicePropertyDeviceUID) == "org.unison.output" {
+        if audio.string(defaultID, kAudioDevicePropertyDeviceUID) == "org.unison.output" {
             let previous = defaults.string(forKey: "unisonNamedPreviousOutput")
             if let fallback = outputs.first(where: { $0.uid == previous }) ?? outputs.first(where: { !$0.isAggregate }) {
-                try? AudioControl.setDefault(fallback.id)
+                try? audio.setDefault(fallback.id)
                 pollAudio()
             }
         }
         guard let owned = defaults.string(forKey: "ownedAggregate"), let stale = outputs.first(where: { $0.uid == owned }) else { return }
         if defaultID == stale.id {
             guard let fallback = outputs.first(where: { $0.uid == defaults.string(forKey: "previousOutput") }) ?? outputs.first(where: { !$0.isAggregate }) else { return }
-            do { try AudioControl.setDefault(fallback.id) } catch { message = error.localizedDescription; return }
+            do { try audio.setDefault(fallback.id) } catch { message = error.localizedDescription; return }
         }
-        if AudioHardwareDestroyAggregateDevice(stale.id) == noErr { defaults.removeObject(forKey: "ownedAggregate"); defaults.removeObject(forKey: "previousOutput") }
+        if audio.destroyAggregate(stale.id) == noErr { defaults.removeObject(forKey: "ownedAggregate"); defaults.removeObject(forKey: "previousOutput") }
         pollAudio()
     }
 
     var usesNativeVolumeKeys: Bool {
-        AudioOutputSelection.usesNativeVolumeKeys(currentID: AudioControl.defaultOutput(), outputs: outputs,
+        AudioOutputSelection.usesNativeVolumeKeys(currentID: audio.defaultOutput(), outputs: outputs,
                                                  processingAudio: softwareAudioRunning || audioStarting,
                                                  controllerID: systemVolume.deviceID)
     }
 
     private func syncNativeVolume(value: Double, muted: Bool?) {
-        if let muted { master = value; masterMuted = muted }
+        let previous = master
+        let previouslyMuted = masterMuted
+        let uid = outputs.first(where: { $0.id == audio.defaultOutput() })?.uid ?? ""
+        let calibration = (calibrations[uid] ?? 1).clamped
+        // The hardware reports the calibrated level. Undo that factor before
+        // storing a master, or every poll/mute cycle applies it a second time.
+        let common = calibration > 0 ? (value / calibration).clamped : master
+        if let muted { master = common; masterMuted = muted }
         // Devices without a mute control use zero volume for mute. Preserve the
         // previous level until a native volume increase or an explicit unmute.
-        else if !masterMuted || value > 0 { master = value; masterMuted = false }
+        else if !masterMuted || value > 0 { master = common; masterMuted = false }
+        if abs(previous - master) > 0.001 || previouslyMuted != masterMuted {
+            defaults.set(master, forKey: "master")
+            applyLinkedMonitorVolume()
+        }
     }
 
     func handleVolumeKey(_ key: Int) -> Bool {
         pollAudio()
         guard hasMasterTargets else { return false }
         if !softwareAudioRunning, !audioStarting, selected.count <= 1,
-           let current = outputs.first(where: { $0.id == AudioControl.defaultOutput() && (selected.isEmpty || selected.contains($0.uid)) }),
-           let value = AudioControl.volume(current.id) {
-            syncNativeVolume(value: value, muted: AudioControl.muted(current.id))
+           let current = outputs.first(where: { $0.id == audio.defaultOutput() && (selected.isEmpty || selected.contains($0.uid)) }),
+           let value = audio.volume(current.id) {
+            syncNativeVolume(value: value, muted: audio.muted(current.id))
         }
         switch key {
         case 0: master = (master + 0.0625).clamped; masterMuted = false
@@ -654,7 +733,7 @@ final class ControlModel: ObservableObject {
 
     private func writeKeyStatus() {
         guard let index = CommandLine.arguments.firstIndex(of: "--key-status"), CommandLine.arguments.count > index + 1 else { return }
-        var text = "accessibility_trusted=\(AXIsProcessTrusted())\nevent_control_allowed=\(CGPreflightPostEventAccess())\nvolume_event_tap_active=\(keysEnabled)\nmaster_targets_available=\(hasMasterTargets)\nsystem_volume_linked=\(systemVolume.deviceID != 0)\nsystem_output_name=\(AudioControl.string(AudioControl.defaultOutput(), kAudioObjectPropertyName))\nnative_volume_keys=\(usesNativeVolumeKeys)\n"
+        var text = "accessibility_trusted=\(AXIsProcessTrusted())\nevent_control_allowed=\(CGPreflightPostEventAccess())\nvolume_event_tap_active=\(keysEnabled)\nmaster_targets_available=\(hasMasterTargets)\nsystem_volume_linked=\(systemVolume.deviceID != 0)\nsystem_output_name=\(audio.string(audio.defaultOutput(), kAudioObjectPropertyName))\nnative_volume_keys=\(usesNativeVolumeKeys)\n"
         if let monitor = monitors.first(where: { $0.builtIn }), let value = monitor.brightness {
             text += "built_in_brightness=\(value)\nmaster_brightness=\(masterBrightness)\n"
         }
@@ -663,7 +742,7 @@ final class ControlModel: ObservableObject {
 
     private func writeAudioStatus() {
         guard let index = CommandLine.arguments.firstIndex(of: "--audio-status"), CommandLine.arguments.count > index + 1 else { return }
-        let text = "starting=\(audioStarting)\nrunning=\(softwareAudioRunning)\nmaster=\(master)\nmuted=\(masterMuted)\nselected=\(selected.sorted())\nrendered=\(softwareAudio.outputUIDs)\ndevice_gains=\(deviceGains)\ndevice_mutes=\(deviceMuted)\ncontroller=\(systemVolume.uid)\namplitude=\(systemVolume.amplitude)\ncallbacks=\(softwareAudio.callbacks)\ninput_signals=\(softwareAudio.signalBlocks)\ninput_layout=\(softwareAudio.inputLayout)\noutput_layout=\(softwareAudio.outputLayout)\ndelivered=\(softwareAudio.deliveredBlocks)\nsystem_output_uid=\(AudioControl.string(defaultID, kAudioDevicePropertyDeviceUID))\navailable_outputs=\(outputs.map(\.uid).sorted())\nbluetooth_return_uid=\(bluetoothRecovery.pending?.bluetoothUID ?? "")\nbluetooth_return_mode=\(bluetoothRecovery.pending?.mode.rawValue ?? "")\nmessage=\(message)\n"
+        let text = "starting=\(audioStarting)\nrunning=\(softwareAudioRunning)\nmaster=\(master)\nmuted=\(masterMuted)\nselected=\(selected.sorted())\nrendered=\(softwareAudio.outputUIDs)\ndevice_gains=\(deviceGains)\ndevice_mutes=\(deviceMuted)\ncontroller=\(systemVolume.uid)\namplitude=\(systemVolume.amplitude)\ncallbacks=\(softwareAudio.callbacks)\ninput_signals=\(softwareAudio.signalBlocks)\ninput_layout=\(softwareAudio.inputLayout)\noutput_layout=\(softwareAudio.outputLayout)\ndelivered=\(softwareAudio.deliveredBlocks)\nsystem_output_uid=\(audio.string(defaultID, kAudioDevicePropertyDeviceUID))\navailable_outputs=\(outputs.map(\.uid).sorted())\nbluetooth_return_uid=\(bluetoothRecovery.pending?.bluetoothUID ?? "")\nbluetooth_return_mode=\(bluetoothRecovery.pending?.mode.rawValue ?? "")\nmessage=\(message)\n"
         try? text.write(toFile: CommandLine.arguments[index + 1], atomically: true, encoding: .utf8)
     }
 
@@ -699,14 +778,15 @@ final class ControlModel: ObservableObject {
         catch { message = error.localizedDescription }
     }
 
-    func startSoftwareAudio() {
-        cancelBluetoothRecovery()
+    func startSoftwareAudio(clearBluetoothRecovery: Bool = true) {
+        guard !shuttingDown else { return }
+        if clearBluetoothRecovery { cancelBluetoothRecovery() }
         guard !audioStarting, !softwareAudioRunning else { return }
-        if groupRunning && !stopGroup() { return }
+        if groupRunning && !stopGroup(clearBluetoothRecovery: clearBluetoothRecovery) { return }
         var targets = outputs.filter { selected.contains($0.uid) && !$0.isAggregate }
         if targets.isEmpty { targets = outputs.filter { $0.id == defaultID && !$0.isAggregate } }
         if targets.isEmpty { targets = Array(outputs.filter { !$0.isAggregate }.prefix(1)) }
-        guard !targets.isEmpty else { message = "Fiziksel ses çıkışı bulunamadı."; return }
+        guard !targets.isEmpty else { retryBluetoothRecovery(); message = "Fiziksel ses çıkışı bulunamadı."; return }
         selected = Set(targets.map(\.uid))
         for target in targets where deviceGains[target.uid] == nil { deviceGains[target.uid] = 1 }
         defaults.set(Array(selected), forKey: "selectedOutputs")
@@ -725,7 +805,7 @@ final class ControlModel: ObservableObject {
                         guard let self, audioGeneration == generation, softwareAudioRunning || audioStarting else { return }
                         master = volume; masterMuted = muted
                         defaults.set(master, forKey: "master")
-                        updateSoftwareGains(); pollAudio()
+                        updateSoftwareGains(); applyLinkedMonitorVolume(); pollAudio()
                     }
                     message = "Ses akışı bekleniyor. Müzik açın ve macOS'un Unison ses yakalama iznini onaylayın. Doğrulanana kadar normal ses korunur."
                 }
@@ -741,9 +821,12 @@ final class ControlModel: ObservableObject {
                             guard let self, audioGeneration == generation, softwareAudioRunning else { return }
                             master = volume; masterMuted = muted
                             defaults.set(master, forKey: "master")
-                            updateSoftwareGains(); pollAudio()
+                            updateSoftwareGains(); applyLinkedMonitorVolume(); pollAudio()
                         }
                         updateSoftwareGains()
+                        if bluetoothRecovery.restoring, systemVolume.deviceID == 0 || audio.defaultOutput() == systemVolume.deviceID {
+                            completeBluetoothRecovery()
+                        }
                         message = "Yazılımsal ses etkin. HDMI sesi sürgülerden kontrol edilebilir."
                         audioTask = nil
                         break
@@ -751,7 +834,7 @@ final class ControlModel: ObservableObject {
                 }
             } catch {
                 guard let self, audioGeneration == generation else { return }
-                stopSoftwareAudio()
+                stopSoftwareAudio(clearBluetoothRecovery: false)
                 if !(error is CancellationError) { message = error.localizedDescription }
             }
         }
@@ -784,7 +867,17 @@ final class ControlModel: ObservableObject {
         audioStarting = false
         systemVolume.stop(); softwareAudio.stop()
         softwareAudioRunning = false
+        if !clearBluetoothRecovery, !shuttingDown { retryBluetoothRecovery() }
     }
+
+    @discardableResult func prepareForTermination() -> Bool {
+        shuttingDown = true
+        stopSoftwareAudio(clearBluetoothRecovery: false)
+        guard stopGroup(clearBluetoothRecovery: false) else { shuttingDown = false; return false }
+        shade.reset()
+        return true
+    }
+
     func outputValue(_ output: Output) -> Double? {
         if softwareAudioRunning || audioStarting, softwareAudio.outputUIDs.contains(output.uid) { return deviceMuted.contains(output.uid) ? 0 : deviceGains[output.uid] ?? 1 }
         return output.volume
@@ -852,7 +945,7 @@ final class ControlModel: ObservableObject {
         return (input, output)
     }
     private func audioSmoke() async {
-        let previous = AudioControl.defaultOutput()
+        let previous = audio.defaultOutput()
         let savedSelection = defaults.stringArray(forKey: "selectedOutputs")
         let savedMaster = defaults.object(forKey: "master")
         let priorMaster = master
@@ -860,8 +953,8 @@ final class ControlModel: ObservableObject {
         let physical = outputs.filter { !$0.isAggregate && ($0.name == "VG249Q3A" || $0.name.localizedCaseInsensitiveContains("MacBook")) }
         var report: [String] = ["accessibility_trusted=\(AXIsProcessTrusted())"]
         let speaker = physical.first { $0.volume != nil }
-        let originalVolume = speaker.flatMap { AudioControl.volume($0.id) }
-        let originalMute = speaker.flatMap { AudioControl.muted($0.id) }
+        let originalVolume = speaker.flatMap { audio.volume($0.id) }
+        let originalMute = speaker.flatMap { audio.muted($0.id) }
         var sound: Process?
         do {
             guard physical.count >= 2 else { throw ControlError.message("İki fiziksel çıkış gerekli.") }
@@ -870,9 +963,9 @@ final class ControlModel: ObservableObject {
                 // Exercise the same native path used by the MacBook row.
                 routeTo(speaker)
                 setOutputVolume(speaker, value: max(0.1, originalVolume * 0.8))
-                let observed = AudioControl.volume(speaker.id) ?? -1
+                let observed = audio.volume(speaker.id) ?? -1
                 let expected = max(0.1, originalVolume * 0.8)
-                guard abs(observed - expected) < 0.01, AudioControl.defaultOutput() == speaker.id else { throw ControlError.message("MacBook yönlendirme/ses geri okuması başarısız.") }
+                guard abs(observed - expected) < 0.01, audio.defaultOutput() == speaker.id else { throw ControlError.message("MacBook yönlendirme/ses geri okuması başarısız.") }
                 guard abs(master - expected) < 0.01,
                       abs((outputs.first(where: { $0.id == speaker.id })?.volume ?? -1) - expected) < 0.01 else {
                     throw ControlError.message("Cihaz sürgüsü ortak sesi aynı işlemde güncellemedi.")
@@ -880,18 +973,18 @@ final class ControlModel: ObservableObject {
                 report.append("macbook_native_volume_and_route=PASS")
                 master = 0.35; masterMuted = false; applyMaster()
                 masterMuted = true; applyMaster(); poll()
-                guard masterMuted, abs(master - 0.35) < 0.01, AudioControl.muted(speaker.id) == true else {
+                guard masterMuted, abs(master - 0.35) < 0.01, audio.muted(speaker.id) == true else {
                     throw ControlError.message("Ortak sessize alma, kayıtlı ses seviyesini korumadı.")
                 }
                 master = 0.4; masterMuted = false; applyMaster()
                 guard abs((outputs.first(where: { $0.id == speaker.id })?.volume ?? -1) - 0.4) < 0.01 else {
                     throw ControlError.message("Ortak sürgü cihaz seviyesini aynı işlemde güncellemedi.")
                 }
-                guard AudioControl.muted(speaker.id) == false, abs((AudioControl.volume(speaker.id) ?? -1) - 0.4) < 0.01 else {
+                guard audio.muted(speaker.id) == false, abs((audio.volume(speaker.id) ?? -1) - 0.4) < 0.01 else {
                     throw ControlError.message("Ortak ses sürgüsü donanım sessizliğini kaldırmadı.")
                 }
                 report.append("native_master_mute_poll_and_unmute=PASS")
-                try AudioControl.setLevel(speaker.id, value: 0.45, muted: false)
+                try audio.setLevel(speaker.id, value: 0.45, muted: false)
                 let notificationDeadline = ContinuousClock.now.advanced(by: .milliseconds(500))
                 while abs(master - 0.45) > 0.01, ContinuousClock.now < notificationDeadline {
                     try await Task.sleep(for: .milliseconds(10))
@@ -905,15 +998,15 @@ final class ControlModel: ObservableObject {
 
             }
             if CommandLine.arguments.contains("--keep-route") {
-                try AudioControl.setDefault(previous)
+                try audio.setDefault(previous)
                 let deadline = Date().addingTimeInterval(2)
-                while AudioControl.defaultOutput() != previous && Date() < deadline { try? await Task.sleep(for: .milliseconds(20)) }
+                while audio.defaultOutput() != previous && Date() < deadline { try? await Task.sleep(for: .milliseconds(20)) }
             }
             if CommandLine.arguments.contains("--selection-smoke"), let speaker {
                 routeTo(speaker)
                 let routeDeadline = Date().addingTimeInterval(2)
-                while AudioControl.defaultOutput() != speaker.id && Date() < routeDeadline { try? await Task.sleep(for: .milliseconds(20)) }
-                guard AudioControl.defaultOutput() == speaker.id else { throw ControlError.message("Ses testi için yerleşik yönlendirme tamamlanmadı.") }
+                while audio.defaultOutput() != speaker.id && Date() < routeDeadline { try? await Task.sleep(for: .milliseconds(20)) }
+                guard audio.defaultOutput() == speaker.id else { throw ControlError.message("Ses testi için yerleşik yönlendirme tamamlanmadı.") }
                 pollAudio()
                 master = 0.5; masterMuted = false
                 for output in physical where output.uid != speaker.uid { toggleOutput(output, enabled: true) }
@@ -927,7 +1020,7 @@ final class ControlModel: ObservableObject {
                 guard audioStarting, softwareAudio.isRunning, systemVolume.deviceID != 0 else { throw ControlError.message("Asenkron ses başlatma tamamlanmadı: \(message)") }
                 report.append("cancel_and_restart_pending_audio=PASS")
                 _ = handleVolumeKey(1)
-                guard abs((AudioControl.volume(speaker.id) ?? -1) - master) < 0.01 else { throw ControlError.message("Ses beklenirken sistem seviyesi güncellenmedi.") }
+                guard abs((audio.volume(speaker.id) ?? -1) - master) < 0.01 else { throw ControlError.message("Ses beklenirken sistem seviyesi güncellenmedi.") }
                 _ = handleVolumeKey(0)
                 report.append("control_center_volume_while_waiting=PASS")
             } else {
@@ -944,7 +1037,7 @@ final class ControlModel: ObservableObject {
             while softwareAudio.signalBlocks == 0 && Date() < deadline { try? await Task.sleep(for: .milliseconds(20)) }
             guard softwareAudio.signalBlocks > 0 else {
                 let log = source.isRunning ? "çalışıyor" : String(data: sourceLog.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                throw ControlError.message("Ses kaynağı alınamadı: callback=\(softwareAudio.callbacks), giriş=\(softwareAudio.inputLayout), motor=\(softwareAudio.isRunning), bekleniyor=\(audioStarting), varsayılan=\(AudioControl.defaultOutput()), denetleyici=\(systemVolume.deviceID), durum=\(message), kaynak=\(source.isRunning), kayıt=\(log).")
+                throw ControlError.message("Ses kaynağı alınamadı: callback=\(softwareAudio.callbacks), giriş=\(softwareAudio.inputLayout), motor=\(softwareAudio.isRunning), bekleniyor=\(audioStarting), varsayılan=\(audio.defaultOutput()), denetleyici=\(systemVolume.deviceID), durum=\(message), kaynak=\(source.isRunning), kayıt=\(log).")
             }
             report.append("first_input_after_ms=\(Int(Date().timeIntervalSince(sourceStarted) * 1000))")
             report.append("before_activation_layout=\(softwareAudio.outputLayout)")
@@ -967,7 +1060,7 @@ final class ControlModel: ObservableObject {
             report.append("output_layout=\(softwareAudio.outputLayout >> 16)buffers/\(softwareAudio.outputLayout & 0xffff)channels")
             report.append("output_signal_blocks=\(both)")
             guard both.count == physical.count, both.allSatisfy({ $0 > 0 }) else {
-                throw ControlError.message("Çıkışlara ses yazılmadı: callback=\(softwareAudio.callbacks), motor=\(softwareAudio.isRunning), varsayılan=\(AudioControl.defaultOutput()), denetleyici=\(systemVolume.deviceID), ortak ses=\(master), sistem seviyesi=\(AudioControl.volume(systemVolume.deviceID) ?? -1), sistem kazancı=\(systemVolume.amplitude), sistem sessiz=\(AudioControl.muted(systemVolume.deviceID).map(String.init) ?? "yok"), sessiz=\(masterMuted), durum=\(message), kaynak=\(source.isRunning).")
+                throw ControlError.message("Çıkışlara ses yazılmadı: callback=\(softwareAudio.callbacks), motor=\(softwareAudio.isRunning), varsayılan=\(audio.defaultOutput()), denetleyici=\(systemVolume.deviceID), ortak ses=\(master), sistem seviyesi=\(audio.volume(systemVolume.deviceID) ?? -1), sistem kazancı=\(systemVolume.amplitude), sistem sessiz=\(audio.muted(systemVolume.deviceID).map(String.init) ?? "yok"), sessiz=\(masterMuted), durum=\(message), kaynak=\(source.isRunning).")
             }
             report.append("both_outputs=PASS")
             var processAddress = AudioControl.address(kAudioHardwarePropertyTranslatePIDToProcessObject)
@@ -979,7 +1072,7 @@ final class ControlModel: ObservableObject {
                 let (input, outputPeaks) = try await testAmplitudes(expected: physical.map { $0.volume != nil ? 1 : level })
                 report.append("amplitude_\(level): input=\(input) outputs=\(outputPeaks) control=\(systemVolume.amplitude)")
                 for output in physical {
-                    if output.volume != nil, abs((AudioControl.volume(output.id) ?? -1) - level) > 0.01 {
+                    if output.volume != nil, abs((audio.volume(output.id) ?? -1) - level) > 0.01 {
                         throw ControlError.message("\(output.name) yerel ses seviyesi çoklu çıkışta değişti.")
                     }
                 }
@@ -988,17 +1081,17 @@ final class ControlModel: ObservableObject {
             master = 0.5; applyMaster()
             if softwareAudioRunning, let speaker {
                 let systemControlID = systemVolume.deviceID
-                let nativeBefore = AudioControl.volume(systemControlID)
+                let nativeBefore = audio.volume(systemControlID)
                 guard systemControlID == speaker.id || systemVolume.uid == "org.unison.output" else { throw ControlError.message("Sistem ses denetimi bağlanmadı.") }
                 let masterBefore = master
                 busy = true
                 let downHandled = handleVolumeKey(1)
                 let lowered = master
-                let systemLowered = AudioControl.volume(systemControlID) ?? -1
+                let systemLowered = audio.volume(systemControlID) ?? -1
                 let upHandled = handleVolumeKey(0)
                 busy = false
                 guard downHandled, upHandled, abs(lowered - (masterBefore - 0.0625)) < 0.001,
-                      abs(master - masterBefore) < 0.001, abs(systemLowered - lowered) < 0.01, abs((AudioControl.volume(systemControlID) ?? -1) - (nativeBefore ?? -2)) < 0.01 else {
+                      abs(master - masterBefore) < 0.001, abs(systemLowered - lowered) < 0.01, abs((audio.volume(systemControlID) ?? -1) - (nativeBefore ?? -2)) < 0.01 else {
                     throw ControlError.message("Ortak ses tuşu denetimi başarısız.")
                 }
                 guard handleVolumeKey(7) else { throw ControlError.message("Sessiz tuşu işlenmedi.") }
@@ -1008,11 +1101,11 @@ final class ControlModel: ObservableObject {
                 guard softwareAudio.deliveredBlocks == keyMuteBefore else { throw ControlError.message("Ses tuşu tüm çıkışları susturmadı.") }
                 _ = handleVolumeKey(7)
                 report.append("volume_keys_common_gain_and_mute=PASS")
-                try AudioControl.setVolume(systemControlID, value: 0.375)
+                try audio.setVolume(systemControlID, value: 0.375)
                 try? await Task.sleep(for: .milliseconds(100))
                 guard abs(master - 0.375) < 0.01 else { throw ControlError.message("Sistem sürgüsü ortak sese geri yansımadı.") }
                 report.append("control_center_volume_bidirectional=PASS")
-                report.append("system_output_name=\(AudioControl.string(AudioControl.defaultOutput(), kAudioObjectPropertyName))")
+                report.append("system_output_name=\(audio.string(audio.defaultOutput(), kAudioObjectPropertyName))")
                 master = masterBefore; applyMaster()
             }
             let commonBeforeRow = master
@@ -1074,7 +1167,7 @@ final class ControlModel: ObservableObject {
                 stopSoftwareAudio()
                 routeTo(speaker)
                 let nativeDeadline = Date().addingTimeInterval(2)
-                while AudioControl.defaultOutput() != speaker.id && Date() < nativeDeadline { try? await Task.sleep(for: .milliseconds(20)) }
+                while audio.defaultOutput() != speaker.id && Date() < nativeDeadline { try? await Task.sleep(for: .milliseconds(20)) }
                 pollAudio()
                 // Simulate the state after a temporary headset disappears, then
                 // verify the automatic return renders to the actual hardware.
@@ -1117,57 +1210,57 @@ final class ControlModel: ObservableObject {
                 stopSoftwareAudio()
                 routeTo(speaker)
                 let routeDeadline = Date().addingTimeInterval(2)
-                while AudioControl.defaultOutput() != speaker.id && Date() < routeDeadline { try? await Task.sleep(for: .milliseconds(20)) }
+                while audio.defaultOutput() != speaker.id && Date() < routeDeadline { try? await Task.sleep(for: .milliseconds(20)) }
                 pollAudio()
                 if let other = outputs.first(where: { $0.id == previous && !$0.isAggregate && $0.volume != nil && $0.id != speaker.id }) {
-                    try AudioControl.setDefault(other.id)
+                    try audio.setDefault(other.id)
                     let switchDeadline = Date().addingTimeInterval(2)
-                    while AudioControl.defaultOutput() != other.id && Date() < switchDeadline { try? await Task.sleep(for: .milliseconds(20)) }
+                    while audio.defaultOutput() != other.id && Date() < switchDeadline { try? await Task.sleep(for: .milliseconds(20)) }
                     pollAudio()
-                    guard selected == [other.uid], usesNativeVolumeKeys, abs(master - (AudioControl.volume(other.id) ?? -1)) < 0.01 else {
+                    guard selected == [other.uid], usesNativeVolumeKeys, abs(master - (audio.volume(other.id) ?? -1)) < 0.01 else {
                         throw ControlError.message("Cihaz yenilemesi ses tuşlarını etkin çıkışa bağlamadı.")
                     }
                     poll()
-                    guard selected == [other.uid], usesNativeVolumeKeys, abs(master - (AudioControl.volume(other.id) ?? -1)) < 0.01 else {
-                        throw ControlError.message("Sistem çıkışı değişimi: seçim=\(selected), varsayılan=\(defaultID), gerçek=\(AudioControl.defaultOutput()), beklenen=\(other.id), ortak ses=\(master), gerçek ses=\(AudioControl.volume(other.id) ?? -1), yerel tuşlar=\(usesNativeVolumeKeys).")
+                    guard selected == [other.uid], usesNativeVolumeKeys, abs(master - (audio.volume(other.id) ?? -1)) < 0.01 else {
+                        throw ControlError.message("Sistem çıkışı değişimi: seçim=\(selected), varsayılan=\(defaultID), gerçek=\(audio.defaultOutput()), beklenen=\(other.id), ortak ses=\(master), gerçek ses=\(audio.volume(other.id) ?? -1), yerel tuşlar=\(usesNativeVolumeKeys).")
                     }
                     report.append("native_output_switch_follows_system=PASS")
                 }
-                try AudioControl.setVolume(speaker.id, value: 0.4)
-                if AudioControl.outputs(includeController: true).contains(where: { $0.uid == "org.unison.output" }) {
-                    try AudioControl.setMute(speaker.id, muted: true)
-                    let bridgePrevious = AudioControl.defaultOutput()
+                try audio.setVolume(speaker.id, value: 0.4)
+                if audio.outputs(includeController: true).contains(where: { $0.uid == "org.unison.output" }) {
+                    try audio.setMute(speaker.id, muted: true)
+                    let bridgePrevious = audio.defaultOutput()
                     do {
                         let bridge = SystemVolumeBridge()
                         defer { bridge.stop() }
                         try bridge.start(outputs: physical, value: 0.4, muted: false, preferNamedOutput: true, renderedUIDs: [speaker.uid]) { _, _ in }
                         try bridge.applyNativeLevels(outputs: physical, master: 0.6, muted: false, gains: [:], deviceMutes: [], calibrations: [:])
-                        guard AudioControl.muted(speaker.id) == false, abs((AudioControl.volume(speaker.id) ?? -1) - 0.6) < 0.01 else {
+                        guard audio.muted(speaker.id) == false, abs((audio.volume(speaker.id) ?? -1) - 0.6) < 0.01 else {
                             throw ControlError.message("Yazılımsal çıkışın donanım sessizliği kaldırılmadı.")
                         }
                     }
                     try? await Task.sleep(for: .milliseconds(200))
-                    guard AudioControl.muted(speaker.id) == true, abs((AudioControl.volume(speaker.id) ?? -1) - 0.4) < 0.01,
-                          AudioControl.defaultOutput() == bridgePrevious else {
-                        throw ControlError.message("Yazılımsal çıkış geri yüklemesi: ses=\(AudioControl.volume(speaker.id) ?? -1), sessiz=\(AudioControl.muted(speaker.id).map(String.init) ?? "yok"), çıkış=\(AudioControl.defaultOutput()), beklenen=\(bridgePrevious).")
+                    guard audio.muted(speaker.id) == true, abs((audio.volume(speaker.id) ?? -1) - 0.4) < 0.01,
+                          audio.defaultOutput() == bridgePrevious else {
+                        throw ControlError.message("Yazılımsal çıkış geri yüklemesi: ses=\(audio.volume(speaker.id) ?? -1), sessiz=\(audio.muted(speaker.id).map(String.init) ?? "yok"), çıkış=\(audio.defaultOutput()), beklenen=\(bridgePrevious).")
                     }
-                    try AudioControl.setMute(speaker.id, muted: false)
+                    try audio.setMute(speaker.id, muted: false)
                     report.append("native_hardware_level_mute_and_restore=PASS")
                 }
             }
         } catch { report.append("ERROR=\(error.localizedDescription)") }
         if let sound, sound.isRunning { sound.terminate() }
         stopSoftwareAudio()
-        if let speaker, let originalVolume { try? AudioControl.setVolume(speaker.id, value: originalVolume) }
-        if let speaker, let originalMute { try? AudioControl.setMute(speaker.id, muted: originalMute) }
-        try? AudioControl.setDefault(previous)
+        if let speaker, let originalVolume { try? audio.setVolume(speaker.id, value: originalVolume) }
+        if let speaker, let originalMute { try? audio.setMute(speaker.id, muted: originalMute) }
+        try? audio.setDefault(previous)
         let restoreDeadline = Date().addingTimeInterval(2)
-        while AudioControl.defaultOutput() != previous && Date() < restoreDeadline { try? await Task.sleep(for: .milliseconds(20)) }
+        while audio.defaultOutput() != previous && Date() < restoreDeadline { try? await Task.sleep(for: .milliseconds(20)) }
         master = priorMaster; masterMuted = priorMuted
         if let savedSelection { defaults.set(savedSelection, forKey: "selectedOutputs") } else { defaults.removeObject(forKey: "selectedOutputs") }
         if let savedMaster { defaults.set(savedMaster, forKey: "master") } else { defaults.removeObject(forKey: "master") }
-        report.append("previous_route_restored=\(AudioControl.defaultOutput() == previous)")
-        if AudioControl.defaultOutput() != previous { report.append("ERROR=Önceki sistem çıkışı geri yüklenemedi.") }
+        report.append("previous_route_restored=\(audio.defaultOutput() == previous)")
+        if audio.defaultOutput() != previous { report.append("ERROR=Önceki sistem çıkışı geri yüklenemedi.") }
         let text = report.joined(separator: "\n") + "\n"
         print(text)
         if let i = CommandLine.arguments.firstIndex(of: "--smoke-report"), CommandLine.arguments.count > i + 1 {

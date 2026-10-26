@@ -19,6 +19,9 @@ final class BluetoothRouteRecoveryTests: XCTestCase {
         var recovery = BluetoothRouteRecovery(pending: saved)
         XCTAssertNil(recovery.update(current: headset, outputs: [speaker, hdmi, headset]))
         XCTAssertEqual(recovery.update(current: speaker, outputs: [speaker, hdmi]), saved)
+        XCTAssertEqual(recovery.pending, saved)
+        XCTAssertNil(recovery.update(current: speaker, outputs: [speaker, hdmi]))
+        recovery.complete()
         XCTAssertNil(recovery.pending)
         XCTAssertNil(recovery.update(current: speaker, outputs: [speaker, hdmi]))
     }
@@ -155,6 +158,7 @@ final class BluetoothRouteRecoveryTests: XCTestCase {
         XCTAssertEqual(restored.outputUIDs, [speaker.uid, hdmi.uid])
         XCTAssertEqual(restored.mode, .automatic)
         XCTAssertEqual(restored.volume, speaker.volume)
+        recovery.complete()
         XCTAssertNil(recovery.pending)
         XCTAssertNil(recovery.update(current: speaker, outputs: [speaker, hdmi]))
     }
@@ -175,6 +179,7 @@ final class BluetoothRouteRecoveryTests: XCTestCase {
         var recovery = BluetoothRouteRecovery(pending: saved)
         let restored = try XCTUnwrap(recovery.update(current: speaker, outputs: [speaker]))
         XCTAssertEqual(restored.outputUIDs, [speaker.uid])
+        recovery.complete()
         XCTAssertNil(recovery.pending)
     }
 
@@ -211,6 +216,7 @@ final class BluetoothRouteRecoveryTests: XCTestCase {
                                                               volume: 0.3, muted: false))
         var recovery = BluetoothRouteRecovery(pending: saved)
         XCTAssertEqual(recovery.update(current: nil, outputs: [speaker]), saved)
+        recovery.complete()
         XCTAssertNil(recovery.pending)
     }
 
@@ -268,4 +274,35 @@ final class BluetoothRouteRecoveryTests: XCTestCase {
         XCTAssertEqual(restored.volume, route().volume)
         XCTAssertTrue(restored.muted)
     }
+    func testFailedReturnIsRetriedAfterBackoffAndCommittedOnlyOnSuccess() {
+        let saved = route()
+        let now = ContinuousClock.now
+        var recovery = BluetoothRouteRecovery(pending: saved)
+        XCTAssertEqual(recovery.update(current: speaker, outputs: [speaker, hdmi], now: now), saved)
+        XCTAssertTrue(recovery.restoring)
+        XCTAssertEqual(recovery.pending, saved)
+        recovery.retry(currentUID: speaker.uid, now: now)
+        XCTAssertNil(recovery.update(current: speaker, outputs: [speaker, hdmi], now: now.advanced(by: .milliseconds(999))))
+        XCTAssertEqual(recovery.update(current: speaker, outputs: [speaker, hdmi], now: now.advanced(by: .seconds(1))), saved)
+        recovery.complete()
+        XCTAssertNil(recovery.pending)
+    }
+
+    func testSystemRouteChangeDuringRetryCancelsReturn() {
+        let now = ContinuousClock.now
+        var recovery = BluetoothRouteRecovery(pending: route())
+        _ = recovery.update(current: speaker, outputs: [speaker, hdmi], now: now)
+        recovery.retry(currentUID: speaker.uid, now: now)
+        XCTAssertNil(recovery.update(current: hdmi, outputs: [speaker, hdmi], now: now.advanced(by: .seconds(2))))
+        XCTAssertNil(recovery.pending)
+    }
+
+    func testIncompleteReturnSurvivesRestart() throws {
+        var recovery = BluetoothRouteRecovery(pending: route())
+        _ = recovery.update(current: speaker, outputs: [speaker, hdmi])
+        let data = try JSONEncoder().encode(XCTUnwrap(recovery.pending))
+        var reopened = BluetoothRouteRecovery(pending: try JSONDecoder().decode(BluetoothAudioRoute.self, from: data))
+        XCTAssertEqual(reopened.update(current: speaker, outputs: [speaker, hdmi]), route())
+    }
+
 }

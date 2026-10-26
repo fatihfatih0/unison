@@ -2,6 +2,13 @@
 
 ## 0.1.0 — Preview
 
+- Bluetooth return stays saved until routing and audio startup succeed; transient failures retry, while explicit stop/selection cancels the return. Menu-bar quit preserves it across restart.
+- Stopping the virtual output falls back to an available physical speaker if the previous output was unplugged.
+- Native volume readback accounts for per-device calibration, preventing repeated attenuation during polling and mute/unmute.
+- Linked DDC monitor volume follows shared controls during software audio and native system-volume changes.
+- Software dimming is reapplied when an external display reconnects.
+- DDC display selection rejects zero, negative, empty and overflowing numeric indices.
+- Hardware-independent model regression tests cover recovery, route completion, shutdown, calibration, linked DDC and display reconnection.
 - SwiftUI menu bar panel for shared and per-device volume/brightness.
 - Refined compact panel with sound/display tabs, visible percentages, selection marks and consistent blue/amber controls.
 - Sliders support keyboard arrows, visible focus and reduced-motion preferences.

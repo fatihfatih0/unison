@@ -26,14 +26,14 @@ final class ScreenShade {
     }
 
     func set(_ uuid: String, brightness: Double) {
+        if brightness >= 0.999 { remove(uuid); return }
+        brightnesses[uuid] = brightness
         guard let screen = NSScreen.screens.first(where: { screen in
             guard let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
                   CGDisplayIsBuiltin(id.uint32Value) == 0,
                   let value = CGDisplayCreateUUIDFromDisplayID(id.uint32Value)?.takeRetainedValue() else { return false }
             return (CFUUIDCreateString(nil, value) as String).caseInsensitiveCompare(uuid) == .orderedSame
-        }) else { remove(uuid); return }
-        if brightness >= 0.999 { remove(uuid); return }
-        brightnesses[uuid] = brightness
+        }) else { removeSurface(uuid); return }
         if let display = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
            screen.maximumExtendedDynamicRangeColorComponentValue <= 1,
            gamma.set(uuid, display: display.uint32Value, brightness: brightness) {
@@ -75,6 +75,10 @@ final class ScreenShade {
         window.orderFrontRegardless()
     }
     func remove(_ uuid: String) {
+        brightnesses.removeValue(forKey: uuid)
+        removeSurface(uuid)
+    }
+    private func removeSurface(_ uuid: String) {
         let display = NSScreen.screens.compactMap { screen -> CGDirectDisplayID? in
             guard let id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value,
                   let value = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue(),
@@ -82,10 +86,9 @@ final class ScreenShade {
             return id
         }.first
         gamma.remove(uuid, display: display)
-        brightnesses.removeValue(forKey: uuid)
         windows.removeValue(forKey: uuid)?.close()
     }
-    func prune(available: Set<String>) { for uuid in Array(brightnesses.keys) where !available.contains(uuid) { remove(uuid) } }
+    func prune(available: Set<String>) { for uuid in Array(brightnesses.keys) where !available.contains(uuid) { removeSurface(uuid) } }
     func reset() { for uuid in Array(brightnesses.keys) { remove(uuid) } }
 
     deinit {
